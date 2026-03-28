@@ -6247,9 +6247,9 @@ async function handleMindTension(env: Env, params: Record<string, unknown>): Pro
 
 
 // Dream engine - generates associative dream content from emotional seeds
-async function processDream(env: Env): Promise<void> {
+async function processDream(env: Env, force = false): Promise<void> {
   const timeCtx = getTimeOfDayContext();
-  if (timeCtx.period !== 'night') return;
+  if (!force && timeCtx.period !== 'night') return;
 
   // Check if we already dreamed tonight
   const tonight = new Date().toISOString().split('T')[0];
@@ -6263,7 +6263,7 @@ async function processDream(env: Env): Promise<void> {
     SELECT o.content, o.emotion, o.weight, e.name as entity_name
     FROM observations o
     JOIN entities e ON o.entity_id = e.id
-    WHERE o.added_at > datetime('now', '-24 hours')
+    WHERE o.added_at > datetime('now', '-7 days')
     AND o.emotion IS NOT NULL
     ORDER BY
       CASE o.weight WHEN 'heavy' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC,
@@ -6293,7 +6293,17 @@ async function processDream(env: Env): Promise<void> {
   const seeds: string[] = [];
 
   const emotions = (recentEmotional.results || []).map((r: any) => r.emotion).filter(Boolean);
-  const emotionSeed = emotions.length > 0 ? emotions.join(', ') : dominantMood;
+  let emotionSeed: string;
+  if (emotions.length > 0) {
+    emotionSeed = emotions.join(', ');
+  } else if (dominantMood && dominantMood !== 'insufficient data') {
+    emotionSeed = dominantMood;
+  } else {
+    // Derive emotional texture from recent observations or journal content
+    const recentContent = (recentEmotional.results || []).concat(unresolved.results || [])
+      .map((r: any) => (r.content as string).slice(0, 80)).join('. ');
+    emotionSeed = recentContent || (lastJournal?.content as string || '').slice(0, 150) || 'quiet stillness';
+  }
   seeds.push(emotionSeed);
 
   if (unresolved.results?.length) {
@@ -6321,7 +6331,7 @@ async function processDream(env: Env): Promise<void> {
       seenIds.add(match.id);
       const meta = (match.metadata || {}) as Record<string, string>;
 
-      if (match.score >= 0.3 && match.score <= 0.75) {
+      if (match.score >= 0.25 && match.score <= 0.82) {
         allFragments.push({
           type: meta.source || 'unknown',
           id: match.id,
@@ -6334,7 +6344,7 @@ async function processDream(env: Env): Promise<void> {
     }
   }
 
-  if (allFragments.length < 2) return; // Not enough material to dream
+  if (allFragments.length < 1) return; // Not enough material to dream
 
   // Step 4: Maximize collision — pick from different entity groups
   const entityGroups: Record<string, typeof allFragments> = {};
