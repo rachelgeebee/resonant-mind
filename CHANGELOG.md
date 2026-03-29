@@ -4,6 +4,15 @@ All notable changes to Resonant Mind. Previously released as "Mind Cloud" (v1.0�
 
 ---
 
+## [3.1.1] - 2026-03-29
+
+### Fixed
+
+- **Dream engine runs independently** — Dream processing was nested inside a large try/catch block with steps 1-8 of the subconscious daemon. Any failure in earlier steps (co-surfacing, orphan detection, novelty recalc, archiving) would silently skip dream generation. Now runs as its own independent block.
+- **Orient dream query format mismatch** — The "last night's dream" query in `mind_orient` used `(CURRENT_DATE - INTERVAL '1 day')::text` which produces a timestamp string (`2026-03-28 00:00:00`) that fails to match the stored `YYYY-MM-DD` date format. Now uses `to_char()` for consistent formatting.
+
+---
+
 ## [3.0.1] - 2026-03-25
 
 ### Fixed

@@ -14,7 +14,7 @@ import type {
   MCPToolHandlerMap
 } from "./types";
 
-const RESONANT_MIND_VERSION = "3.1.0";
+const RESONANT_MIND_VERSION = "3.1.1";
 
 // Surface pool configuration
 const SURFACE_POOL_RATIOS = { core: 0.5, novelty: 0.2, dormant: 0.2, edge: 0.1 };
@@ -839,7 +839,7 @@ async function handleMindOrient(env: Env): Promise<string> {
     const lastDream = await env.DB.prepare(`
       SELECT content, dream_date, recurring_dream_id, recurrence_count
       FROM dreams
-      WHERE dream_date >= (CURRENT_DATE - INTERVAL '1 day')::text
+      WHERE dream_date >= to_char(CURRENT_DATE - INTERVAL '1 day', 'YYYY-MM-DD')
       ORDER BY created_at DESC LIMIT 1
     `).first();
 
@@ -7205,16 +7205,16 @@ async function processSubconscious(env: Env): Promise<void> {
       console.log(`Reflection error: ${e}`);
     }
 
-    // 9. Dream processing — only runs during night hours (22:00-05:00)
-    try {
-      await processDream(env);
-    } catch (e) {
-      console.log(`Dream processing error: ${e}`);
-    }
-
   } catch (e) {
     // Living surface tables might not exist yet - that's fine
     console.log(`Living surface tables not ready: ${e}`);
+  }
+
+  // 9. Dream processing — independent, runs during night hours (22:00-05:00)
+  try {
+    await processDream(env);
+  } catch (e) {
+    console.log(`Dream processing error: ${e}`);
   }
 
   // Get counts for orient display
