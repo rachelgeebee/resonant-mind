@@ -20,10 +20,10 @@ index_name = "theo-mind-vectors"
 [ai]
 binding = "AI"
 
-# R2 for image storage (uncomment when R2 is enabled on the account)
-# [[r2_buckets]]
-# binding = "R2_IMAGES"
-# bucket_name = "resonant-mind-images"
+# R2 for image storage
+[[r2_buckets]]
+binding = "R2_IMAGES"
+bucket_name = "resonant-mind-images"
 
 # Cron triggers for subconscious daemon processing
 [triggers]
