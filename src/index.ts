@@ -7,7 +7,7 @@ import { routeRequest } from "./http/router";
 import { handleMcpProtocolRequest } from "./mcp/protocol";
 import { createD1Adapter } from "./adapter";
 import { createVectorAdapter } from "./vectors";
-import { getEmbedding as getGeminiEmbedding, getImageEmbedding, generateText as geminiGenerateText } from "./embeddings";
+import { getEmbedding as getCfEmbedding, getImageEmbedding } from "./embeddings";
 import type {
   Env,
   MCPToolDefinition,
@@ -15,6 +15,17 @@ import type {
 } from "./types";
 
 const RESONANT_MIND_VERSION = "3.1.2";
+
+// Optional Gemini text generation — used for daemon consolidation/reflection when key is available
+async function generateTextViaGemini(apiKey: string, prompt: string): Promise<string> {
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+  });
+  const data = await response.json() as any;
+  return data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+}
 
 // Surface pool configuration
 const SURFACE_POOL_RATIOS = { core: 0.5, novelty: 0.2, dormant: 0.2, edge: 0.1 };
@@ -497,9 +508,9 @@ function workerUrl(env: Env): string {
   return "https://localhost";
 }
 
-// Generate embedding using Gemini Embedding 2
+// Generate embedding using Cloudflare Workers AI
 async function getEmbedding(env: Env, text: string): Promise<number[]> {
-  return getGeminiEmbedding(env.GEMINI_API_KEY, text);
+  return getCfEmbedding(env.AI, text);
 }
 
 async function searchVectors(env: Env, query: string, topK: number) {
@@ -3676,7 +3687,7 @@ async function handleMindStoreImage(env: Env, params: Record<string, unknown>): 
           context ? `(${context})` : "", emotion ? `[${emotion}]` : ""
         ].filter(Boolean).join(" ");
         const embeddingBinary = finalBinary || Uint8Array.from(atob(imageData), c => c.charCodeAt(0));
-        embedding = await getImageEmbedding(env.GEMINI_API_KEY, embeddingBinary.buffer as ArrayBuffer, storedPath?.includes('.webp') ? 'image/webp' : mimeType, contextText);
+        embedding = await getImageEmbedding(env.AI, embeddingBinary.buffer as ArrayBuffer, storedPath?.includes('.webp') ? 'image/webp' : mimeType, contextText);
       } else {
         const semanticText = [
           entityName ? `${entityName}:` : "", description,
@@ -6532,7 +6543,8 @@ async function consolidateRelatedObservations(env: Env): Promise<number> {
       const prompt = `You are consolidating related memories about "${candidate.name}". Summarize these ${obsTexts.length} observations into ONE concise observation (1-2 sentences) that captures the essential meaning. Preserve emotional significance.\n\n${obsTexts.map((t: string, i: number) => `${i + 1}. ${t}`).join('\n')}\n\nConsolidated observation:`;
 
       try {
-        const summary = await geminiGenerateText(env.GEMINI_API_KEY, prompt);
+        if (!env.GEMINI_API_KEY) { console.log('Skipping consolidation — no GEMINI_API_KEY'); continue; }
+        const summary = await generateTextViaGemini(env.GEMINI_API_KEY, prompt);
         if (!summary || summary.length < 10) continue;
 
         // Find the heaviest weight among originals
@@ -6603,7 +6615,8 @@ async function generateSessionReflection(env: Env): Promise<void> {
   const prompt = `You are reflecting on recent experiences stored in memory. Based on these ${recentObs.results!.length} recent memories, generate one concise insight (1-2 sentences) about what pattern or theme emerges. Be specific and observational, not generic.\n\n${obsText}\n\nInsight:`;
 
   try {
-    const insight = await geminiGenerateText(env.GEMINI_API_KEY, prompt);
+    if (!env.GEMINI_API_KEY) { console.log('Skipping reflection — no GEMINI_API_KEY'); return; }
+    const insight = await generateTextViaGemini(env.GEMINI_API_KEY, prompt);
     if (!insight || insight.length < 10) return;
 
     const entryDate = new Date().toISOString().split('T')[0];

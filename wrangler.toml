@@ -1,43 +1,39 @@
-name = "resonant-mind"
+name = "theo-mind"
 main = "src/index.ts"
 compatibility_date = "2024-12-18"
 compatibility_flags = ["nodejs_compat"]
 
 workers_dev = true
 
-# Uncomment and configure for custom domain:
-# [[routes]]
-# pattern = "your-domain.example.com"
-# custom_domain = true
+# D1 database — existing theo-mind database
+[[d1_databases]]
+binding = "DB"
+database_name = "theo-mind"
+database_id = "aeb33eee-486e-4ebe-8a76-0d0822f92f82"
 
-# Uncomment for Postgres via Hyperdrive (alternative to D1):
-# [[hyperdrive]]
-# binding = "HYPERDRIVE"
-# id = "your-hyperdrive-id"
+# Vectorize index — existing theo-mind vectors
+[[vectorize]]
+binding = "VECTORS"
+index_name = "theo-mind-vectors"
 
-# R2 for image storage
-[[r2_buckets]]
-binding = "R2_IMAGES"
-bucket_name = "resonant-mind-images"
+# Cloudflare AI for embeddings
+[ai]
+binding = "AI"
 
-# Static assets for dashboard (uncomment when dashboard is ready)
-# [assets]
-# directory = "./dashboard"
+# R2 for image storage (uncomment when R2 is enabled on the account)
+# [[r2_buckets]]
+# binding = "R2_IMAGES"
+# bucket_name = "resonant-mind-images"
 
 # Cron triggers for subconscious daemon processing
 [triggers]
-crons = ["*/30 * * * *"]
+crons = ["0 */6 * * *"]
 
 # Environment variables (set via wrangler secret or dashboard):
 # MIND_API_KEY        - Required. API key for authentication
-# GEMINI_API_KEY      - Required. Google Gemini API key for embeddings
+# GEMINI_API_KEY      - Optional. Google Gemini API key (for text generation features)
 # SIGNING_SECRET      - Optional. Separate secret for signed URLs (defaults to MIND_API_KEY)
-# MCP_CONNECTOR_SECRET - Optional. Secret path for MCP connector auth
-# WEATHER_API_KEY     - Optional. WeatherAPI.com key for inner weather
-# DASHBOARD_ALLOWED_ORIGIN - Optional. CORS origin for dashboard
 # WORKER_URL          - Optional. Public URL of this worker (for signed image URLs)
 # R2_PATH_PREFIX      - Optional. R2 key prefix (default: "resonant-mind-images")
-# LOCATION_NAME       - Optional. Location name (e.g., "London, UK")
-# LOCATION_LAT        - Optional. Latitude
-# LOCATION_LON        - Optional. Longitude
-# LOCATION_TZ         - Optional. Timezone (e.g., "Europe/London")
+# LOCATION_NAME       - Optional. Location name
+# LOCATION_TZ         - Optional. Timezone

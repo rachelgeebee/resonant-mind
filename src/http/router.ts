@@ -5,7 +5,7 @@ import {
   timingSafeEqual
 } from "./auth";
 import { createApiPreflightResponse, withSecurityHeaders } from "./response";
-import { getEmbedding as getGeminiEmbedding, getImageEmbedding } from "../embeddings";
+import { getEmbedding as getCfEmbedding, getImageEmbedding } from "../embeddings";
 import type { Env } from "../types";
 
 interface AppRouteHandlers {
@@ -204,7 +204,7 @@ async function handleImageUpload(request: Request, env: Env): Promise<Response> 
     let embedded = false;
     let embeddingError: string | null = null;
     try {
-      const embedding = await getImageEmbedding(env.GEMINI_API_KEY, rawBytes.buffer as ArrayBuffer, mimeType, contextText);
+      const embedding = await getImageEmbedding(env.AI, rawBytes.buffer as ArrayBuffer, mimeType, contextText);
       const metadata: Record<string, string> = {
         source: "image", description, weight, added_at: new Date().toISOString()
       };
@@ -218,7 +218,7 @@ async function handleImageUpload(request: Request, env: Env): Promise<Response> 
     } catch (e) {
       console.error("Multimodal embedding failed:", e);
       try {
-        const textEmbedding = await getGeminiEmbedding(env.GEMINI_API_KEY, contextText);
+        const textEmbedding = await getCfEmbedding(env.AI, contextText);
         const metadata: Record<string, string> = {
           source: "image", description, weight, added_at: new Date().toISOString()
         };
