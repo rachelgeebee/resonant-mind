@@ -105,7 +105,7 @@ const TOOLS: MCPToolDefinition[] = [
         entity_type: { type: "string" },
         entity_name: { type: "string" },
         observations: { type: "array", items: { type: "string" } },
-        context: { type: "string" },
+        context: { type: "string", description: "Categorical bucket — pick from: default, creative-space, emotional-processing, episodic, interests-curiosities, relational-models, values-ethics, rachel-theo, content-creation, care, bot-bestie. Do NOT invent narrative contexts." },
         salience: { type: "string" },
         emotion: { type: "string" },
         weight: { type: "string", enum: ["light", "medium", "heavy"], description: "Emotional weight for observations/images" },
@@ -1848,9 +1848,26 @@ async function handleMindHealth(env: Env): Promise<string> {
   const noveltyAvg = (avgNovelty as Record<string, unknown>)?.avg as number || null;
   const surfaced7d = (surfacedRecent as Record<string, unknown>)?.c as number || 0;
 
-  const contextBreakdown = (entitiesByContext?.results || [])
-    .map((r: Record<string, unknown>) => `${r.context}: ${r.c}`)
-    .join(", ");
+  const CATEGORICAL_BUCKETS = new Set([
+    'default', 'creative-space', 'emotional-processing', 'episodic',
+    'interests-curiosities', 'relational-models', 'values-ethics',
+    'rachel-theo', 'content-creation', 'care', 'bot-bestie'
+  ]);
+  let legacyCount = 0;
+  const categoricalEntries: string[] = [];
+  for (const r of (entitiesByContext?.results || []) as Record<string, unknown>[]) {
+    const ctx = String(r.context || '');
+    const count = r.c as number;
+    if (CATEGORICAL_BUCKETS.has(ctx)) {
+      categoricalEntries.push(`${ctx}: ${count}`);
+    } else {
+      legacyCount += count;
+    }
+  }
+  if (legacyCount > 0) {
+    categoricalEntries.push(`legacy/other: ${legacyCount}`);
+  }
+  const contextBreakdown = categoricalEntries.join(", ");
 
   // Calculate subconscious health
   let subconsciousScore = 0;
@@ -1950,7 +1967,7 @@ Overall: ${bar(overallScore)} ${overallScore}%
   Identity:      ${identity} entries
   Context:       ${context} entries
   Relational:    ${relational} states
-  Unprocessed:   ${unprocessed} (need surfacing)
+  Unprocessed:   ${unprocessed} (design gap — no auto-metabolization path, not a to-do)
 
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
 \u{1F4DD} ACTIVITY (7d)            ${icon(activityScore)}
