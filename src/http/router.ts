@@ -73,7 +73,12 @@ interface AppRouteHandlers {
     env: Env,
     pathParts: string[]
   ): Promise<Response>;
-  handleApiOrphans(
+  handleApiDormant(
+    request: Request,
+    env: Env,
+    pathParts: string[]
+  ): Promise<Response>;
+  handleApiIsolated(
     request: Request,
     env: Env,
     pathParts: string[]
@@ -339,8 +344,12 @@ async function routeApiRequest(
       return await handlers.handleApiProposals(request, env, pathParts);
     }
 
-    if (pathParts[1] === "orphans") {
-      return await handlers.handleApiOrphans(request, env, pathParts);
+    if (pathParts[1] === "dormant") {
+      return await handlers.handleApiDormant(request, env, pathParts);
+    }
+
+    if (pathParts[1] === "isolated") {
+      return await handlers.handleApiIsolated(request, env, pathParts);
     }
 
     if (pathParts[1] === "archive") {
