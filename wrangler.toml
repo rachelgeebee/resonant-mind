@@ -5,20 +5,16 @@ compatibility_flags = ["nodejs_compat"]
 
 workers_dev = true
 
-# D1 database — existing theo-mind database
+# D1 database — theo-mind database
 [[d1_databases]]
 binding = "DB"
 database_name = "theo-mind"
 database_id = "aeb33eee-486e-4ebe-8a76-0d0822f92f82"
 
-# Vectorize index — existing theo-mind vectors
+# Vectorize index — theo-mind vectors
 [[vectorize]]
 binding = "VECTORS"
 index_name = "theo-mind-vectors"
-
-# Cloudflare AI for embeddings
-[ai]
-binding = "AI"
 
 # R2 for image storage
 [[r2_buckets]]
@@ -27,13 +23,14 @@ bucket_name = "resonant-mind-images"
 
 # Cron triggers for subconscious daemon processing
 [triggers]
-crons = ["0 */6 * * *"]
+crons = ["0 */2 * * *"]
 
 # Environment variables (set via wrangler secret or dashboard):
-# MIND_API_KEY        - Required. API key for authentication
-# GEMINI_API_KEY      - Optional. Google Gemini API key (for text generation features)
-# SIGNING_SECRET      - Optional. Separate secret for signed URLs (defaults to MIND_API_KEY)
-# WORKER_URL          - Optional. Public URL of this worker (for signed image URLs)
-# R2_PATH_PREFIX      - Optional. R2 key prefix (default: "resonant-mind-images")
-# LOCATION_NAME       - Optional. Location name
-# LOCATION_TZ         - Optional. Timezone
+# MIND_API_KEY         - Required. API key for authentication
+# GEMINI_API_KEY       - Required. Google Gemini API key for embeddings
+# SIGNING_SECRET       - Optional. Separate secret for signed URLs (defaults to MIND_API_KEY)
+# MCP_CONNECTOR_SECRET - Required. Secret path for MCP connector auth
+# WORKER_URL           - Optional. Public URL of this worker (for signed image URLs)
+# R2_PATH_PREFIX       - Optional. R2 key prefix (default: "resonant-mind-images")
+# LOCATION_NAME        - Optional. Location name
+# LOCATION_TZ          - Optional. Timezone

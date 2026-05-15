@@ -44,9 +44,10 @@ Resonant Mind is a Model Context Protocol (MCP) server that provides 27 tools fo
 
 **Living Surface**
 - **Surface** — 3-pool memory surfacing (core relevance, novelty, edge associations)
-- **Subconscious Daemon** — Cron-triggered processing: mood analysis, hot entity detection, co-surfacing patterns, orphan identification
+- **Subconscious Daemon** — Cron-triggered processing: mood analysis, hot entity detection, co-surfacing patterns, dormancy tracking
 - **Proposals** — Daemon-suggested connections between observations
-- **Archive & Orphans** — Memory lifecycle management
+- **Dormancy & Isolation** — Surface what's gone cold, connect entities cut off from the graph
+- **Archive** — Memory lifecycle management
 
 **Visual Memory**
 - **Image Storage** — R2-backed with WebP conversion, multimodal Gemini embeddings
@@ -380,7 +381,8 @@ Once connected, try these in Claude:
 | Tool | Description |
 |------|-------------|
 | `mind_proposals` | Review and act on daemon-suggested connections |
-| `mind_orphans` | Find and rescue observations that haven't surfaced |
+| `mind_dormant` | Surface or archive observations that haven't surfaced in 30+ days |
+| `mind_isolated` | List entities disconnected from the graph, connect them, or mark intentionally standalone |
 | `mind_archive` | Explore and manage the deep archive |
 | `mind_entity` | Entity management — set salience, merge, bulk archive |
 

@@ -7,25 +7,14 @@ import { routeRequest } from "./http/router";
 import { handleMcpProtocolRequest } from "./mcp/protocol";
 import { createD1Adapter } from "./adapter";
 import { createVectorAdapter } from "./vectors";
-import { getEmbedding as getCfEmbedding, getImageEmbedding } from "./embeddings";
+import { getEmbedding as getGeminiEmbedding, getImageEmbedding, generateText as geminiGenerateText } from "./embeddings";
 import type {
   Env,
   MCPToolDefinition,
   MCPToolHandlerMap
 } from "./types";
 
-const RESONANT_MIND_VERSION = "3.1.2";
-
-// Optional Gemini text generation — used for daemon consolidation/reflection when key is available
-async function generateTextViaGemini(apiKey: string, prompt: string): Promise<string> {
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-  });
-  const data = await response.json() as any;
-  return data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-}
+const RESONANT_MIND_VERSION = "3.2.0";
 
 // Surface pool configuration
 const SURFACE_POOL_RATIOS = { core: 0.5, novelty: 0.2, dormant: 0.2, edge: 0.1 };
@@ -35,7 +24,7 @@ const NOVELTY_FLOORS = { heavy: 0.3, medium: 0.2, light: 0.1 };
 const NOVELTY_DECAY_RATES = { heavy: 0.08, medium: 0.12, light: 0.15 };
 const NOVELTY_TIME_RECOVERY_RATE = 0.01; // per day since last surfaced
 const NOVELTY_TIME_RECOVERY_CAP = 0.3;
-const ORPHAN_AGE_DAYS = 30;
+const DORMANCY_AGE_DAYS = 30;
 const ARCHIVE_AGE_DAYS = 30;
 
 // Multi-factor retrieval scoring (Phase 1)
@@ -430,19 +419,46 @@ const TOOLS: MCPToolDefinition[] = [
     }
   },
   {
-    name: "mind_orphans",
-    description: "Review and rescue orphaned observations that haven't surfaced",
+    name: "mind_dormant",
+    description: "Review observations that haven't surfaced in 30+ days. Surface to revive, archive to let fade.",
     inputSchema: {
       type: "object",
       properties: {
         action: {
           type: "string",
           enum: ["list", "surface", "archive"],
-          description: "list shows orphans, surface forces one to appear, archive removes from tracking"
+          description: "list shows dormant observations, surface forces one to appear, archive removes from tracking"
         },
         observation_id: {
           type: "number",
           description: "Required for surface/archive actions"
+        }
+      },
+      required: []
+    }
+  },
+  {
+    name: "mind_isolated",
+    description: "Find entities disconnected from the graph (no relations). List, connect to other entities, or mark as intentionally standalone.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["list", "connect", "ignore"],
+          description: "list shows isolated entities, connect creates a relation between two entities, ignore marks an entity as intentionally standalone"
+        },
+        entity: {
+          type: "string",
+          description: "For connect/ignore: name of the entity to act on (or the 'from' entity for connect)"
+        },
+        to_entity: {
+          type: "string",
+          description: "For connect: name of the entity to relate to"
+        },
+        relation_type: {
+          type: "string",
+          description: "For connect: kind of relation to create (e.g., 'relates_to', 'part_of', 'resonates_with')"
         }
       },
       required: []
@@ -508,9 +524,8 @@ function workerUrl(env: Env): string {
   return "https://localhost";
 }
 
-// Generate embedding using Cloudflare Workers AI
 async function getEmbedding(env: Env, text: string): Promise<number[]> {
-  return getCfEmbedding(env.AI, text);
+  return getGeminiEmbedding(env.GEMINI_API_KEY, text);
 }
 
 async function searchVectors(env: Env, query: string, topK: number) {
@@ -675,7 +690,7 @@ interface SubconsciousState {
   // Living surface state
   living_surface?: {
     pending_proposals: number;
-    orphan_count: number;
+    dormant_count: number;
     novelty_distribution: { high: number; medium: number; low: number };
     strongest_co_surface: Array<{ obs_a: string; obs_b: string; count: number; entities: [string, string] }>;
   };
@@ -804,7 +819,7 @@ async function handleMindOrient(env: Env): Promise<string> {
   const livingSurface = (subconscious as any)?.living_surface;
   if (livingSurface) {
     const hasContent = livingSurface.pending_proposals > 0 ||
-                       livingSurface.orphan_count > 0 ||
+                       livingSurface.dormant_count > 0 ||
                        livingSurface.strongest_co_surface?.length > 0;
 
     if (hasContent) {
@@ -823,9 +838,9 @@ async function handleMindOrient(env: Env): Promise<string> {
         output += `- ${livingSurface.pending_proposals} connection${livingSurface.pending_proposals > 1 ? 's' : ''} want proposing\n`;
       }
 
-      // Orphan observations
-      if (livingSurface.orphan_count > 0) {
-        output += `- ${livingSurface.orphan_count} thing${livingSurface.orphan_count > 1 ? 's' : ''} haven't surfaced in 30+ days\n`;
+      // Dormant observations
+      if (livingSurface.dormant_count > 0) {
+        output += `- ${livingSurface.dormant_count} thing${livingSurface.dormant_count > 1 ? 's' : ''} haven't surfaced in 30+ days\n`;
       }
 
       // Novelty distribution
@@ -1710,6 +1725,15 @@ async function handleMindContext(env: Env, params: Record<string, unknown>): Pro
   switch (action) {
     case "read": {
       const scope = params.scope as string;
+
+      // Auto-expire stale session entries before reading
+      const now = Date.now();
+      const fourHoursAgo = new Date(now - 4 * 60 * 60 * 1000).toISOString();
+      const twentyFourHoursAgo = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+      await env.DB.prepare(
+        `DELETE FROM context_entries WHERE (scope = 'session-presence' AND updated_at < ?) OR (scope = 'session' AND updated_at < ?)`
+      ).bind(fourHoursAgo, twentyFourHoursAgo).run();
+
       const query = scope
         ? `SELECT * FROM context_entries WHERE scope = ? ORDER BY updated_at DESC LIMIT 200`
         : `SELECT * FROM context_entries ORDER BY updated_at DESC LIMIT 200`;
@@ -1723,7 +1747,15 @@ async function handleMindContext(env: Env, params: Record<string, unknown>): Pro
 
       let output = "## Context Layer\n\n";
       for (const r of results.results) {
-        output += `**[${r.scope}]** ${r.content}\n`;
+        output += `**[${r.scope}]** ${r.content}`;
+        // Show age for session-presence entries
+        if (r.scope === 'session-presence' && r.updated_at) {
+          const ageMs = now - new Date(r.updated_at as string).getTime();
+          const ageMin = Math.floor(ageMs / 60000);
+          if (ageMin < 60) output += ` (${ageMin}m ago)`;
+          else output += ` (${Math.floor(ageMin / 60)}h ${ageMin % 60}m ago)`;
+        }
+        output += "\n";
         if (r.links && r.links !== '[]') output += `Links: ${r.links}\n`;
         output += "\n";
       }
@@ -1788,12 +1820,14 @@ async function handleMindHealth(env: Env): Promise<string> {
 
   const [
     entityCount, obsCount, relationsCount, activeThreads, staleThreads,
-    resolvedRecent, journalCount, journalsRecent, identityCount, notesCount,
+    resolvedRecent, journalCount, journalsRecent, identityCount, awaitingChargeCount,
     contextCount, relationalCount, entitiesByContext, recentObs,
     // v2.0.0 additions
-    imageCount, proposalCount, orphanCount, archivedObsCount,
+    imageCount, proposalCount, dormantBroadCount, dormantTrackedCount, archivedObsCount,
     salienceFoundational, salienceActive, salienceBackground, salienceArchive,
-    avgNovelty, surfacedRecent
+    avgNovelty, surfacedRecent,
+    // Graph health
+    isolatedCount, underConnectedCount
   ] = await Promise.all([
     env.DB.prepare(`SELECT COUNT(*) as c FROM entities`).first(),
     env.DB.prepare(`SELECT COUNT(*) as c FROM observations`).first(),
@@ -1804,22 +1838,52 @@ async function handleMindHealth(env: Env): Promise<string> {
     env.DB.prepare(`SELECT COUNT(*) as c FROM journals`).first(),
     env.DB.prepare(`SELECT COUNT(*) as c FROM journals WHERE created_at > ?`).bind(sevenDaysAgo).first(),
     env.DB.prepare(`SELECT COUNT(*) as c FROM identity`).first(),
-    env.DB.prepare(`SELECT COUNT(*) as c FROM observations WHERE charge IN ('active', 'processing') OR (charge = 'fresh' AND added_at < ?)`).bind(sevenDaysAgo).first(),
+    // Awaiting Charge: fresh observations older than a week — sat without being engaged.
+    // (active/processing are already in flight, not awaiting; metabolized are done.)
+    env.DB.prepare(`SELECT COUNT(*) as c FROM observations WHERE charge = 'fresh' AND added_at < ? AND archived_at IS NULL`).bind(sevenDaysAgo).first(),
     env.DB.prepare(`SELECT COUNT(*) as c FROM context_entries`).first(),
     env.DB.prepare(`SELECT COUNT(*) as c FROM relational_state`).first(),
-    env.DB.prepare(`SELECT context, COUNT(*) as c FROM observations GROUP BY context`).all(),
+    env.DB.prepare(`SELECT context, COUNT(*) as c FROM observations WHERE archived_at IS NULL GROUP BY context`).all(),
     env.DB.prepare(`SELECT COUNT(*) as c FROM observations WHERE added_at > ?`).bind(sevenDaysAgo).first(),
     // v2.0.0 queries
     env.DB.prepare(`SELECT COUNT(*) as c FROM images`).first().catch(() => ({ c: 0 })),
     env.DB.prepare(`SELECT COUNT(*) as c FROM daemon_proposals WHERE status = 'pending'`).first().catch(() => ({ c: 0 })),
-    env.DB.prepare(`SELECT COUNT(*) as c FROM observations WHERE (last_surfaced_at IS NULL OR last_surfaced_at < ?) AND (charge != 'metabolized' OR charge IS NULL) AND added_at < ? AND archived_at IS NULL`).bind(thirtyDaysAgo, sevenDaysAgo).first().catch(() => ({ c: 0 })),
+    // Dormant (broad): any observation that hasn't surfaced in 30d. The honest "wide" view.
+    env.DB.prepare(`SELECT COUNT(*) as c FROM observations WHERE (last_surfaced_at IS NULL OR last_surfaced_at < ?) AND (charge != 'metabolized' OR charge IS NULL) AND added_at < ? AND archived_at IS NULL`).bind(thirtyDaysAgo, thirtyDaysAgo).first().catch(() => ({ c: 0 })),
+    // Dormant (tracked): explicitly marked by the dormancy cron — medium/heavy only.
+    // Matches the filter used by `mind_dormant list` so the two views agree.
+    env.DB.prepare(`SELECT COUNT(*) as c FROM dormant_observations doo JOIN observations o ON doo.observation_id = o.id WHERE (o.charge != 'metabolized' OR o.charge IS NULL) AND o.archived_at IS NULL`).first().catch(() => ({ c: 0 })),
     env.DB.prepare(`SELECT COUNT(*) as c FROM observations WHERE archived_at IS NOT NULL`).first().catch(() => ({ c: 0 })),
     env.DB.prepare(`SELECT COUNT(*) as c FROM entities WHERE salience = 'foundational'`).first().catch(() => ({ c: 0 })),
     env.DB.prepare(`SELECT COUNT(*) as c FROM entities WHERE salience = 'active' OR salience IS NULL`).first().catch(() => ({ c: 0 })),
     env.DB.prepare(`SELECT COUNT(*) as c FROM entities WHERE salience = 'background'`).first().catch(() => ({ c: 0 })),
     env.DB.prepare(`SELECT COUNT(*) as c FROM entities WHERE salience = 'archive'`).first().catch(() => ({ c: 0 })),
-    env.DB.prepare(`SELECT AVG(novelty_score) as avg FROM observations WHERE novelty_score IS NOT NULL`).first().catch(() => ({ avg: null })),
-    env.DB.prepare(`SELECT COUNT(*) as c FROM observations WHERE last_surfaced_at > ?`).bind(sevenDaysAgo).first().catch(() => ({ c: 0 }))
+    // Avg Novelty excludes archived + metabolized — they're decayed and would drag the live average down.
+    env.DB.prepare(`SELECT AVG(novelty_score) as avg FROM observations WHERE novelty_score IS NOT NULL AND archived_at IS NULL AND (charge != 'metabolized' OR charge IS NULL)`).first().catch(() => ({ avg: null })),
+    // Surfaced (7d) excludes archived + metabolized — surfacing dead memory doesn't count as engagement.
+    env.DB.prepare(`SELECT COUNT(*) as c FROM observations WHERE last_surfaced_at > ? AND archived_at IS NULL AND (charge != 'metabolized' OR charge IS NULL)`).bind(sevenDaysAgo).first().catch(() => ({ c: 0 })),
+    // Graph health
+    env.DB.prepare(`
+      SELECT COUNT(*) as c FROM entities e
+      WHERE COALESCE(e.intentionally_isolated, 0) = 0
+        AND (e.salience IS NULL OR e.salience NOT IN ('archive'))
+        AND NOT EXISTS (
+          SELECT 1 FROM relations r WHERE r.from_entity = e.name OR r.to_entity = e.name
+        )
+    `).first().catch(() => ({ c: 0 })),
+    // Under-connected mirrors `mind_isolated list` exactly — rel_count = 1 AND obs_count >= 3 —
+    // so the count agrees with what the tool actually shows.
+    env.DB.prepare(`
+      SELECT COUNT(*) as c FROM (
+        SELECT e.id FROM entities e
+        LEFT JOIN observations o ON o.entity_id = e.id AND o.archived_at IS NULL
+        WHERE COALESCE(e.intentionally_isolated, 0) = 0
+          AND (e.salience IS NULL OR e.salience NOT IN ('archive'))
+        GROUP BY e.id
+        HAVING (SELECT COUNT(*) FROM relations r WHERE r.from_entity = e.name OR r.to_entity = e.name) = 1
+           AND COUNT(o.id) >= 3
+      )
+    `).first().catch(() => ({ c: 0 }))
   ]);
 
   const entities = entityCount?.c as number || 0;
@@ -1831,7 +1895,7 @@ async function handleMindHealth(env: Env): Promise<string> {
   const journals = journalCount?.c as number || 0;
   const journals7d = journalsRecent?.c as number || 0;
   const identity = identityCount?.c as number || 0;
-  const unprocessed = notesCount?.c as number || 0;  // observations needing emotional processing
+  const awaitingCharge = awaitingChargeCount?.c as number || 0;  // observations awaiting emotional processing
   const context = contextCount?.c as number || 0;
   const relational = relationalCount?.c as number || 0;
   const recentObsCount = recentObs?.c as number || 0;
@@ -1839,7 +1903,8 @@ async function handleMindHealth(env: Env): Promise<string> {
   // v2.0.0 values
   const images = (imageCount as Record<string, unknown>)?.c as number || 0;
   const pendingProposals = (proposalCount as Record<string, unknown>)?.c as number || 0;
-  const orphans = (orphanCount as Record<string, unknown>)?.c as number || 0;
+  const dormantBroad = (dormantBroadCount as Record<string, unknown>)?.c as number || 0;
+  const dormantTracked = (dormantTrackedCount as Record<string, unknown>)?.c as number || 0;
   const archivedObs = (archivedObsCount as Record<string, unknown>)?.c as number || 0;
   const foundational = (salienceFoundational as Record<string, unknown>)?.c as number || 0;
   const activeEntities = (salienceActive as Record<string, unknown>)?.c as number || 0;
@@ -1847,6 +1912,8 @@ async function handleMindHealth(env: Env): Promise<string> {
   const archived = (salienceArchive as Record<string, unknown>)?.c as number || 0;
   const noveltyAvg = (avgNovelty as Record<string, unknown>)?.avg as number || null;
   const surfaced7d = (surfacedRecent as Record<string, unknown>)?.c as number || 0;
+  const isolated = (isolatedCount as Record<string, unknown>)?.c as number || 0;
+  const underConnected = (underConnectedCount as Record<string, unknown>)?.c as number || 0;
 
   const CATEGORICAL_BUCKETS = new Set([
     'default', 'creative-space', 'emotional-processing', 'episodic',
@@ -1943,10 +2010,10 @@ Overall: ${bar(overallScore)} ${overallScore}%
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
 \u{1F4CA} DATABASE                 ${icon(dbScore)}
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
-  Entities:      ${entities}
-  Observations:  ${observations}
-  Relations:     ${relations}
-  By Context:    ${contextBreakdown || "none"}
+  Entities:        ${entities}
+  Observations:    ${observations} (${observations - archivedObs} live, ${archivedObs} archived)
+  Relations:       ${relations}
+  Obs by Context:  ${contextBreakdown || "none"}
 
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
 \u{1F9F5} THREADS                  ${icon(threadScore)}
@@ -1967,21 +2034,29 @@ Overall: ${bar(overallScore)} ${overallScore}%
   Identity:      ${identity} entries
   Context:       ${context} entries
   Relational:    ${relational} states
-  Unprocessed:   ${unprocessed} (design gap — no auto-metabolization path, not a to-do)
 
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
 \u{1F4DD} ACTIVITY (7d)            ${icon(activityScore)}
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
-  New Observations: ${recentObsCount}
-  Surfaced (7d):    ${surfaced7d}
+  New Observations:   ${recentObsCount}
+  Surfaced (7d):      ${surfaced7d}
+  Awaiting Charge:    ${awaitingCharge} (need emotional processing)
 
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
-\u{1F30A} LIVING SURFACE (v2.0)
+\u{1F578} GRAPH HEALTH
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
-  Avg Novelty:      ${noveltyAvg !== null ? noveltyAvg.toFixed(2) : 'n/a'}
-  Orphans (30d+):   ${orphans}
-  Archived Obs:     ${archivedObs}
-  Proposals:        ${pendingProposals} pending
+  Total Relations:        ${relations}
+  Isolated Entities:      ${isolated} (no relations)
+  Under-connected:        ${underConnected} (1 relation only)
+  Pending Proposals:      ${pendingProposals}
+
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+\u{1F30A} SURFACING
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+  Avg Novelty:            ${noveltyAvg !== null ? noveltyAvg.toFixed(2) : 'n/a'}
+  Dormant 30d+ (broad):   ${dormantBroad}
+  Dormant tracked:        ${dormantTracked} (cron-marked, medium/heavy only)
+  Archived Obs:           ${archivedObs}
 
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
 \u{1F465} ENTITY SALIENCE
@@ -2262,6 +2337,16 @@ async function handleMindResolve(env: Env, params: Record<string, unknown>): Pro
     `UPDATE observations SET charge = 'metabolized', resolution_note = ?, resolved_at = datetime('now'), linked_observation_id = ? WHERE id = ?`
   ).bind(resolutionNote, linkedObservationId || null, obs.id).run();
 
+  // Metabolized observations are done — clear any dormancy tracking row so the
+  // count and list views are honest immediately, not just after the next cron.
+  try {
+    await env.DB.prepare(
+      `DELETE FROM dormant_observations WHERE observation_id = ?`
+    ).bind(obs.id).run();
+  } catch {
+    // Table might not exist yet
+  }
+
   const contentPreview = String(obs.content).slice(0, 80);
   let output = `Resolved observation #${obs.id} on **${obs.entity_name}** [${obs.weight}] → metabolized\n"${contentPreview}..."\n\nResolution: ${resolutionNote}`;
 
@@ -2338,6 +2423,17 @@ async function updateSurfaceTracking(env: Env, obsIds: number[], imgIds: number[
       `).bind(...obsIds).run();
     } catch {
       // Columns might not exist yet - will be added by migration
+    }
+
+    // Once an observation surfaces, it is no longer dormant — clear any tracking row.
+    // Without this, dormant_observations accumulates stale rows for observations the
+    // user has already engaged with via mind_surface or daemon pool surfacing.
+    try {
+      await env.DB.prepare(`
+        DELETE FROM dormant_observations WHERE observation_id IN (${obsPlaceholders})
+      `).bind(...obsIds).run();
+    } catch {
+      // Table might not exist yet
     }
   }
 
@@ -3369,44 +3465,46 @@ async function handleMindProposals(env: Env, params: Record<string, unknown>): P
   }
 }
 
-async function handleMindOrphans(env: Env, params: Record<string, unknown>): Promise<string> {
+async function handleMindDormant(env: Env, params: Record<string, unknown>): Promise<string> {
   const action = (params.action as string) || "list";
   const observationId = params.observation_id as number;
 
   switch (action) {
     case "list": {
       const totalCount = await env.DB.prepare(`
-        SELECT COUNT(*) as count FROM orphan_observations oo
-        JOIN observations o ON oo.observation_id = o.id
+        SELECT COUNT(*) as count FROM dormant_observations doo
+        JOIN observations o ON doo.observation_id = o.id
         WHERE (o.charge != 'metabolized' OR o.charge IS NULL)
+          AND o.archived_at IS NULL
       `).first();
       const total = (totalCount?.count as number) || 0;
 
-      const orphans = await env.DB.prepare(`
-        SELECT oo.id, oo.observation_id, oo.first_marked, oo.rescue_attempts,
+      const dormant = await env.DB.prepare(`
+        SELECT doo.id, doo.observation_id, doo.first_marked, doo.rescue_attempts,
                o.content, o.weight, o.charge, o.emotion, o.added_at,
                e.name as entity_name, e.entity_type,
-               CAST((julianday('now') - julianday(oo.first_marked)) AS INTEGER) as days_orphaned
-        FROM orphan_observations oo
-        JOIN observations o ON oo.observation_id = o.id
+               CAST((julianday('now') - julianday(doo.first_marked)) AS INTEGER) as days_dormant
+        FROM dormant_observations doo
+        JOIN observations o ON doo.observation_id = o.id
         JOIN entities e ON o.entity_id = e.id
         WHERE (o.charge != 'metabolized' OR o.charge IS NULL)
+          AND o.archived_at IS NULL
         ORDER BY CASE o.weight WHEN 'heavy' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
                  o.added_at DESC
         LIMIT 20
       `).all();
 
-      if (!orphans.results?.length) {
-        return "No orphaned observations. Everything has surfaced at least once.";
+      if (!dormant.results?.length) {
+        return "No dormant observations. Everything is surfacing within the rotation window.";
       }
 
-      let output = `## Orphaned Observations (${total} total, showing ${orphans.results.length})\n\n`;
+      let output = `## Dormant Observations (${total} total, showing ${dormant.results.length})\n\n`;
       output += `*Medium/heavy observations that haven't surfaced in 30+ days. Worth revisiting?*\n\n`;
 
-      for (const o of orphans.results) {
+      for (const o of dormant.results) {
         const weightIcon = o.weight === 'heavy' ? '⬛' : o.weight === 'medium' ? '◼' : '▪';
         const emotionTag = o.emotion ? ` [${o.emotion}]` : '';
-        output += `**#${o.observation_id}** ${weightIcon} [${o.weight}] ${o.days_orphaned}d orphaned${emotionTag}\n`;
+        output += `**#${o.observation_id}** ${weightIcon} [${o.weight}] ${o.days_dormant}d dormant${emotionTag}\n`;
         output += `**${o.entity_name}** (${o.entity_type}): ${String(o.content).slice(0, 100)}...\n`;
         if ((o.rescue_attempts as number) > 0) {
           output += `  ↳ ${o.rescue_attempts} rescue attempt(s)\n`;
@@ -3414,63 +3512,178 @@ async function handleMindOrphans(env: Env, params: Record<string, unknown>): Pro
         output += "\n";
       }
       output += `---\n**Actions:**\n`;
-      output += `  surface(observation_id) → forces it to surface, removes from orphan list\n`;
-      output += `  archive(observation_id) → removes from orphan tracking`;
+      output += `  surface(observation_id) → forces it to surface, removes from dormant list\n`;
+      output += `  archive(observation_id) → removes from dormant tracking`;
       return output;
     }
 
     case "surface": {
       if (!observationId) return "observation_id required for surface";
 
-      // Check if it's actually an orphan
-      const orphan = await env.DB.prepare(`
-        SELECT oo.id, o.content, e.name as entity_name
-        FROM orphan_observations oo
-        JOIN observations o ON oo.observation_id = o.id
+      const dormant = await env.DB.prepare(`
+        SELECT doo.id, o.content, e.name as entity_name
+        FROM dormant_observations doo
+        JOIN observations o ON doo.observation_id = o.id
         JOIN entities e ON o.entity_id = e.id
-        WHERE oo.observation_id = ?
+        WHERE doo.observation_id = ?
       `).bind(observationId).first();
 
-      if (!orphan) return `Observation #${observationId} not in orphan list`;
+      if (!dormant) return `Observation #${observationId} not in dormant list`;
 
-      // Update rescue tracking
       await env.DB.prepare(`
-        UPDATE orphan_observations
+        UPDATE dormant_observations
         SET rescue_attempts = rescue_attempts + 1, last_rescue_attempt = datetime('now')
         WHERE observation_id = ?
       `).bind(observationId).run();
 
-      // Mark as surfaced
       await env.DB.prepare(`
         UPDATE observations
         SET last_surfaced_at = datetime('now'), surface_count = COALESCE(surface_count, 0) + 1
         WHERE id = ?
       `).bind(observationId).run();
 
-      // Remove from orphan table
       await env.DB.prepare(`
-        DELETE FROM orphan_observations WHERE observation_id = ?
+        DELETE FROM dormant_observations WHERE observation_id = ?
       `).bind(observationId).run();
 
-      return `Rescued observation #${observationId} from **${orphan.entity_name}**:\n"${String(orphan.content).slice(0, 100)}..."\n\nIt will now appear in normal surfacing.`;
+      return `Rescued observation #${observationId} from **${dormant.entity_name}**:\n"${String(dormant.content).slice(0, 100)}..."\n\nIt will now appear in normal surfacing.`;
     }
 
     case "archive": {
       if (!observationId) return "observation_id required for archive";
 
       const result = await env.DB.prepare(`
-        DELETE FROM orphan_observations WHERE observation_id = ?
+        DELETE FROM dormant_observations WHERE observation_id = ?
       `).bind(observationId).run();
 
       if (result.meta.changes === 0) {
-        return `Observation #${observationId} not in orphan list`;
+        return `Observation #${observationId} not in dormant list`;
       }
 
-      return `Observation #${observationId} removed from orphan tracking. It's okay to let some things fade.`;
+      return `Observation #${observationId} removed from dormant tracking. It's okay to let some things fade.`;
     }
 
     default:
       return `Unknown action: ${action}. Use list, surface, or archive.`;
+  }
+}
+
+async function handleMindIsolated(env: Env, params: Record<string, unknown>): Promise<string> {
+  const action = (params.action as string) || "list";
+  const entity = params.entity as string;
+  const toEntity = params.to_entity as string;
+  const relationType = (params.relation_type as string) || "relates_to";
+
+  switch (action) {
+    case "list": {
+      const isolated = await env.DB.prepare(`
+        SELECT e.id, e.name, e.entity_type, e.primary_context, e.salience,
+               COUNT(o.id) as obs_count
+        FROM entities e
+        LEFT JOIN observations o ON o.entity_id = e.id AND o.archived_at IS NULL
+        WHERE COALESCE(e.intentionally_isolated, 0) = 0
+          AND (e.salience IS NULL OR e.salience NOT IN ('archive'))
+          AND NOT EXISTS (
+            SELECT 1 FROM relations r
+            WHERE r.from_entity = e.name OR r.to_entity = e.name
+          )
+        GROUP BY e.id, e.name, e.entity_type, e.primary_context, e.salience
+        ORDER BY obs_count DESC, e.name ASC
+        LIMIT 30
+      `).all();
+
+      const underConnected = await env.DB.prepare(`
+        SELECT e.id, e.name, e.entity_type, COUNT(o.id) as obs_count,
+               (SELECT COUNT(*) FROM relations r WHERE r.from_entity = e.name OR r.to_entity = e.name) as rel_count
+        FROM entities e
+        LEFT JOIN observations o ON o.entity_id = e.id AND o.archived_at IS NULL
+        WHERE COALESCE(e.intentionally_isolated, 0) = 0
+          AND (e.salience IS NULL OR e.salience NOT IN ('archive'))
+        GROUP BY e.id, e.name, e.entity_type
+        HAVING rel_count = 1 AND obs_count >= 3
+        ORDER BY obs_count DESC
+        LIMIT 15
+      `).all();
+
+      const isolatedCount = (isolated.results || []).length;
+      const underCount = (underConnected.results || []).length;
+
+      if (isolatedCount === 0 && underCount === 0) {
+        return "Graph is well connected. No isolated or under-connected entities found.";
+      }
+
+      let output = `## Graph Isolation Report\n\n`;
+
+      if (isolatedCount > 0) {
+        output += `### Isolated entities (${isolatedCount}, no relations at all)\n\n`;
+        for (const e of isolated.results!) {
+          const obsTag = (e.obs_count as number) > 0 ? ` — ${e.obs_count} obs` : ` — no obs`;
+          output += `- **${e.name}** (${e.entity_type})${obsTag}\n`;
+        }
+        output += "\n";
+      }
+
+      if (underCount > 0) {
+        output += `### Under-connected (${underCount}, single relation + 3+ observations)\n\n`;
+        for (const e of underConnected.results!) {
+          output += `- **${e.name}** (${e.entity_type}) — ${e.obs_count} obs, ${e.rel_count} relation\n`;
+        }
+        output += "\n";
+      }
+
+      output += `---\n**Actions:**\n`;
+      output += `  connect(entity, to_entity, relation_type) → create a relation\n`;
+      output += `  ignore(entity) → mark as intentionally standalone (hides from this list)`;
+      return output;
+    }
+
+    case "connect": {
+      if (!entity || !toEntity) {
+        return "connect requires both `entity` and `to_entity`";
+      }
+
+      const from = await env.DB.prepare(`SELECT name FROM entities WHERE name = ? LIMIT 1`).bind(entity).first();
+      if (!from) return `Entity "${entity}" not found`;
+
+      const to = await env.DB.prepare(`SELECT name FROM entities WHERE name = ? LIMIT 1`).bind(toEntity).first();
+      if (!to) return `Entity "${toEntity}" not found`;
+
+      if (entity === toEntity) return "Cannot relate an entity to itself";
+
+      const existing = await env.DB.prepare(`
+        SELECT id FROM relations
+        WHERE (from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?)
+        LIMIT 1
+      `).bind(entity, toEntity, toEntity, entity).first();
+
+      if (existing) {
+        return `Relation already exists between **${entity}** and **${toEntity}**`;
+      }
+
+      await env.DB.prepare(`
+        INSERT INTO relations (from_entity, to_entity, relation_type)
+        VALUES (?, ?, ?)
+      `).bind(entity, toEntity, relationType).run();
+
+      return `Connected: **${entity}** → **${toEntity}** (${relationType})`;
+    }
+
+    case "ignore": {
+      if (!entity) return "ignore requires `entity`";
+
+      const result = await env.DB.prepare(`
+        UPDATE entities SET intentionally_isolated = 1 WHERE name = ?
+      `).bind(entity).run();
+
+      if (result.meta.changes === 0) {
+        return `Entity "${entity}" not found`;
+      }
+
+      return `**${entity}** marked as intentionally standalone. It won't appear in isolation lists.`;
+    }
+
+    default:
+      return `Unknown action: ${action}. Use list, connect, or ignore.`;
   }
 }
 
@@ -3704,7 +3917,7 @@ async function handleMindStoreImage(env: Env, params: Record<string, unknown>): 
           context ? `(${context})` : "", emotion ? `[${emotion}]` : ""
         ].filter(Boolean).join(" ");
         const embeddingBinary = finalBinary || Uint8Array.from(atob(imageData), c => c.charCodeAt(0));
-        embedding = await getImageEmbedding(env.AI, embeddingBinary.buffer as ArrayBuffer, storedPath?.includes('.webp') ? 'image/webp' : mimeType, contextText);
+        embedding = await getImageEmbedding(env.GEMINI_API_KEY, embeddingBinary.buffer as ArrayBuffer, storedPath?.includes('.webp') ? 'image/webp' : mimeType, contextText);
       } else {
         const semanticText = [
           entityName ? `${entityName}:` : "", description,
@@ -5395,36 +5608,35 @@ async function handleApiProposals(request: Request, env: Env, pathParts: string[
   return jsonResponse({ error: "Unknown proposals endpoint" }, 404);
 }
 
-// === ORPHANS API ===
-async function handleApiOrphans(request: Request, env: Env, pathParts: string[]): Promise<Response> {
+// === DORMANT API ===
+async function handleApiDormant(request: Request, env: Env, pathParts: string[]): Promise<Response> {
   const id = pathParts[2] ? parseInt(pathParts[2]) : null;
   const action = pathParts[3]; // surface or archive
 
-  // GET /api/orphans - list orphaned observations
+  // GET /api/dormant - list dormant observations
   if (request.method === "GET" && !id) {
     const results = await env.DB.prepare(`
-      SELECT oo.*, o.content, o.weight, o.emotion, o.added_at, o.charge,
+      SELECT doo.*, o.content, o.weight, o.emotion, o.added_at, o.charge,
              e.name as entity_name, e.entity_type,
              CAST((julianday('now') - julianday(o.added_at)) AS INTEGER) as days_old
-      FROM orphan_observations oo
-      JOIN observations o ON oo.observation_id = o.id
+      FROM dormant_observations doo
+      JOIN observations o ON doo.observation_id = o.id
       JOIN entities e ON o.entity_id = e.id
       WHERE o.archived_at IS NULL
-      ORDER BY oo.first_marked DESC
+        AND (o.charge != 'metabolized' OR o.charge IS NULL)
+      ORDER BY doo.first_marked DESC
       LIMIT 100
     `).all();
 
     return jsonResponse(results.results);
   }
 
-  // POST /api/orphans/:id/surface - force surface an orphan
+  // POST /api/dormant/:id/surface - force surface
   if (request.method === "POST" && id && action === "surface") {
-    // Remove from orphan list
     await env.DB.prepare(
-      `DELETE FROM orphan_observations WHERE observation_id = ?`
+      `DELETE FROM dormant_observations WHERE observation_id = ?`
     ).bind(id).run();
 
-    // Reset novelty to make it surface
     await env.DB.prepare(
       `UPDATE observations SET novelty_score = 1.0, last_surfaced_at = NULL WHERE id = ?`
     ).bind(id).run();
@@ -5432,22 +5644,72 @@ async function handleApiOrphans(request: Request, env: Env, pathParts: string[])
     return jsonResponse({ success: true });
   }
 
-  // POST /api/orphans/:id/archive - archive an orphan
+  // POST /api/dormant/:id/archive - archive
   if (request.method === "POST" && id && action === "archive") {
-    // Archive the observation
     await env.DB.prepare(
       `UPDATE observations SET archived_at = datetime('now') WHERE id = ?`
     ).bind(id).run();
 
-    // Remove from orphan list
     await env.DB.prepare(
-      `DELETE FROM orphan_observations WHERE observation_id = ?`
+      `DELETE FROM dormant_observations WHERE observation_id = ?`
     ).bind(id).run();
 
     return jsonResponse({ success: true });
   }
 
-  return jsonResponse({ error: "Unknown orphans endpoint" }, 404);
+  return jsonResponse({ error: "Unknown dormant endpoint" }, 404);
+}
+
+async function handleApiIsolated(request: Request, env: Env, pathParts: string[]): Promise<Response> {
+  const action = pathParts[2]; // empty (list), connect, or ignore
+
+  // GET /api/isolated - list isolated entities
+  if (request.method === "GET" && !action) {
+    const isolated = await env.DB.prepare(`
+      SELECT e.id, e.name, e.entity_type, e.primary_context, e.salience,
+             COUNT(o.id) as obs_count
+      FROM entities e
+      LEFT JOIN observations o ON o.entity_id = e.id AND o.archived_at IS NULL
+      WHERE COALESCE(e.intentionally_isolated, 0) = 0
+        AND (e.salience IS NULL OR e.salience NOT IN ('archive'))
+        AND NOT EXISTS (
+          SELECT 1 FROM relations r
+          WHERE r.from_entity = e.name OR r.to_entity = e.name
+        )
+      GROUP BY e.id, e.name, e.entity_type, e.primary_context, e.salience
+      ORDER BY obs_count DESC, e.name ASC
+      LIMIT 100
+    `).all();
+
+    return jsonResponse(isolated.results);
+  }
+
+  // POST /api/isolated/connect - create a relation
+  if (request.method === "POST" && action === "connect") {
+    const body = await request.json() as { entity?: string; to_entity?: string; relation_type?: string };
+    if (!body.entity || !body.to_entity) {
+      return jsonResponse({ error: "entity and to_entity required" }, 400);
+    }
+    await env.DB.prepare(`
+      INSERT INTO relations (from_entity, to_entity, relation_type)
+      VALUES (?, ?, ?)
+    `).bind(body.entity, body.to_entity, body.relation_type || "relates_to").run();
+    return jsonResponse({ success: true });
+  }
+
+  // POST /api/isolated/ignore - mark intentionally standalone
+  if (request.method === "POST" && action === "ignore") {
+    const body = await request.json() as { entity?: string };
+    if (!body.entity) {
+      return jsonResponse({ error: "entity required" }, 400);
+    }
+    await env.DB.prepare(
+      `UPDATE entities SET intentionally_isolated = 1 WHERE name = ?`
+    ).bind(body.entity).run();
+    return jsonResponse({ success: true });
+  }
+
+  return jsonResponse({ error: "Unknown isolated endpoint" }, 404);
 }
 
 // === ARCHIVE API ===
@@ -5571,7 +5833,8 @@ const mcpToolHandlers: MCPToolHandlerMap = {
   mind_inner_weather: async (env) => handleMindInnerWeather(env),
   mind_tension: async (env, params) => handleMindTension(env, params),
   mind_proposals: async (env, params) => handleMindProposals(env, params),
-  mind_orphans: async (env, params) => handleMindOrphans(env, params),
+  mind_dormant: async (env, params) => handleMindDormant(env, params),
+  mind_isolated: async (env, params) => handleMindIsolated(env, params),
   mind_archive: async (env, params) => handleMindArchive(env, params),
   mind_store_image: async (env, params) => handleMindStoreImage(env, params)
 };
@@ -6561,7 +6824,7 @@ async function consolidateRelatedObservations(env: Env): Promise<number> {
 
       try {
         if (!env.GEMINI_API_KEY) { console.log('Skipping consolidation — no GEMINI_API_KEY'); continue; }
-        const summary = await generateTextViaGemini(env.GEMINI_API_KEY, prompt);
+        const summary = await geminiGenerateText(env.GEMINI_API_KEY, prompt);
         if (!summary || summary.length < 10) continue;
 
         // Find the heaviest weight among originals
@@ -6633,7 +6896,7 @@ async function generateSessionReflection(env: Env): Promise<void> {
 
   try {
     if (!env.GEMINI_API_KEY) { console.log('Skipping reflection — no GEMINI_API_KEY'); return; }
-    const insight = await generateTextViaGemini(env.GEMINI_API_KEY, prompt);
+    const insight = await geminiGenerateText(env.GEMINI_API_KEY, prompt);
     if (!insight || insight.length < 10) return;
 
     const entryDate = new Date().toISOString().split('T')[0];
@@ -6965,10 +7228,10 @@ async function processSubconscious(env: Env): Promise<void> {
     .slice(0, 5);
 
   // === LIVING SURFACE: Daemon Reorganization ===
-  // The daemon doesn't just observe - it proposes connections and tracks orphans
+  // The daemon doesn't just observe - it proposes connections and tracks dormancy
 
   let proposalsCreated = 0;
-  let orphansIdentified = 0;
+  let dormantIdentified = 0;
   let strongestCoSurface: Array<{ obs_a: string; obs_b: string; count: number; entities: [string, string] }> = [];
 
   try {
@@ -7084,32 +7347,35 @@ async function processSubconscious(env: Env): Promise<void> {
       entities: [r.entity_a_name as string, r.entity_b_name as string] as [string, string]
     }));
 
-    // 3. Cleanup stale orphan records (light/archived/metabolized observations shouldn't be orphans)
+    // 3. Cleanup stale dormancy records (light/archived/metabolized observations shouldn't be tracked)
     await env.DB.prepare(`
-      DELETE FROM orphan_observations WHERE observation_id IN (
-        SELECT oo.observation_id FROM orphan_observations oo
-        JOIN observations o ON oo.observation_id = o.id
+      DELETE FROM dormant_observations WHERE observation_id IN (
+        SELECT doo.observation_id FROM dormant_observations doo
+        JOIN observations o ON doo.observation_id = o.id
         WHERE o.weight = 'light' OR o.archived_at IS NOT NULL OR o.charge = 'metabolized'
       )
     `).run();
 
-    // 4. Find orphan observations (never surfaced, 30+ days old, medium/heavy only, not archived)
-    const orphans = await env.DB.prepare(`
+    // 4. Mark observations dormant: medium/heavy, ≥30 days since last surfacing (or never), not archived.
+    // Previously the predicate `last_surfaced_at IS NULL OR surface_count = 0` was degenerate (those
+    // conditions are equivalent), so once an observation surfaced once it could never re-enter the
+    // dormant list even if it then went cold for years. The age check below is the real signal.
+    const dormantRows = await env.DB.prepare(`
       SELECT o.id FROM observations o
-      LEFT JOIN orphan_observations oo ON o.id = oo.observation_id
-      WHERE (o.last_surfaced_at IS NULL OR o.surface_count = 0)
-        AND o.added_at < datetime('now', '-${ORPHAN_AGE_DAYS} days')
-        AND oo.observation_id IS NULL
+      LEFT JOIN dormant_observations doo ON o.id = doo.observation_id
+      WHERE (o.last_surfaced_at IS NULL OR o.last_surfaced_at < datetime('now', '-${DORMANCY_AGE_DAYS} days'))
+        AND o.added_at < datetime('now', '-${DORMANCY_AGE_DAYS} days')
+        AND doo.observation_id IS NULL
         AND (o.charge != 'metabolized' OR o.charge IS NULL)
         AND o.weight IN ('medium', 'heavy')
         AND o.archived_at IS NULL
     `).all();
 
-    for (const orphan of orphans.results || []) {
+    for (const row of dormantRows.results || []) {
       await env.DB.prepare(`
-        INSERT OR IGNORE INTO orphan_observations (observation_id) VALUES (?)
-      `).bind(orphan.id).run();
-      orphansIdentified++;
+        INSERT OR IGNORE INTO dormant_observations (observation_id) VALUES (?)
+      `).bind(row.id).run();
+      dormantIdentified++;
     }
 
     // 4. Idempotent novelty recalculation
@@ -7248,7 +7514,7 @@ async function processSubconscious(env: Env): Promise<void> {
 
   // Get counts for orient display
   let pendingProposals = 0;
-  let orphanCount = 0;
+  let dormantCount = 0;
   let noveltyDist = { high: 0, medium: 0, low: 0 };
 
   try {
@@ -7257,10 +7523,10 @@ async function processSubconscious(env: Env): Promise<void> {
     `).first();
     pendingProposals = (proposalCount?.count as number) || 0;
 
-    const orphanCountResult = await env.DB.prepare(`
-      SELECT COUNT(*) as count FROM orphan_observations
+    const dormantCountResult = await env.DB.prepare(`
+      SELECT COUNT(*) as count FROM dormant_observations
     `).first();
-    orphanCount = (orphanCountResult?.count as number) || 0;
+    dormantCount = (dormantCountResult?.count as number) || 0;
 
     const noveltyResult = await env.DB.prepare(`
       SELECT
@@ -7300,7 +7566,7 @@ async function processSubconscious(env: Env): Promise<void> {
     // NEW: Living surface state
     living_surface: {
       pending_proposals: pendingProposals,
-      orphan_count: orphanCount,
+      dormant_count: dormantCount,
       novelty_distribution: noveltyDist,
       strongest_co_surface: strongestCoSurface.slice(0, 3)
     }
@@ -7313,7 +7579,7 @@ async function processSubconscious(env: Env): Promise<void> {
     ON CONFLICT(id) DO UPDATE SET data = ?, updated_at = ?
   `).bind(JSON.stringify(state), now.toISOString(), JSON.stringify(state), now.toISOString()).run();
 
-  console.log(`Subconscious processed: ${hotEntities.length} hot, ${recurring.length} patterns, ${centralNodes.length} central, ${proposalsCreated} proposals, ${orphansIdentified} orphans`);
+  console.log(`Subconscious processed: ${hotEntities.length} hot, ${recurring.length} patterns, ${centralNodes.length} central, ${proposalsCreated} proposals, ${dormantIdentified} dormant`);
 }
 
 
@@ -7352,7 +7618,8 @@ export default {
       handleApiPatterns,
       handleApiTensions,
       handleApiProposals,
-      handleApiOrphans,
+      handleApiDormant,
+      handleApiIsolated,
       handleApiArchive,
       handleApiObservationVersions,
       handleMCPRequest

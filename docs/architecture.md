@@ -22,7 +22,7 @@ Resonant Mind models cognition as five interconnected systems:
 ├──────────────┴───────────────┴───────────────────┤
 │                SUBCONSCIOUS DAEMON                │
 │  (runs on a cron — finds patterns, detects mood, │
-│   proposes connections, identifies orphans)       │
+│   proposes connections, tracks dormancy)          │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -107,7 +107,7 @@ The wake-up sequence. When an AI connects and calls `mind_orient`, it gets:
 - Recent journal for emotional context
 - Current relational state toward people
 - Subconscious mood
-- What's moving beneath (orphans, proposals, co-surfacing patterns)
+- What's moving beneath (dormant observations, proposals, co-surfacing patterns)
 
 `mind_ground` follows with:
 
@@ -162,16 +162,17 @@ A cron-triggered process that runs every 30 minutes (configurable). It doesn't i
 2. **Mood analysis** — detects the dominant emotion from recent observations
 3. **Co-surfacing tracking** — when two observations surface together multiple times, it strengthens their associative connection
 4. **Proposal generation** — when co-surfacing patterns are strong enough, it proposes a formal relationship between the observations
-5. **Orphan identification** — finds observations that haven't surfaced in 30+ days
+5. **Dormancy tracking** — marks observations that haven't surfaced in 30+ days (medium/heavy weight only) for later review
 6. **Graph analysis** — maps entity connectivity, central nodes, relation patterns
 
 ### How results are used
 
-- `mind_orient` shows mood, hot entities, and living surface state
+- `mind_orient` shows mood, hot entities, and surfacing state
 - `mind_search` tints queries with the detected mood
 - `mind_surface` uses hot entities to deepen resonance
 - `mind_proposals` lets the AI review and accept/reject suggested connections
-- `mind_orphans` lets the AI rescue forgotten memories
+- `mind_dormant` lets the AI rescue observations that have gone cold
+- `mind_isolated` surfaces entities cut off from the relation graph
 
 ## Storage Architecture
 

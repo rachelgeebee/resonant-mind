@@ -1,6 +1,6 @@
 {
   "name": "resonant-mind",
-  "version": "3.1.2",
+  "version": "3.2.0",
   "description": "Persistent memory MCP server for AI systems — semantic memory, emotional processing, identity continuity",
   "license": "SEE LICENSE IN LICENSE",
   "scripts": {
@@ -13,7 +13,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241218.0",
     "@types/pg": "^8.20.0",
-    "typescript": "^5.3.3",
+    "typescript": "^5.9.3",
     "wrangler": "^4.54.0"
   },
   "dependencies": {
