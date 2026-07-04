@@ -59,6 +59,7 @@ interface AppRouteHandlers {
   handleApiHealth(env: Env): Promise<Response>;
   handleApiHealthScores(env: Env): Promise<Response>;
   handleApiStats(env: Env): Promise<Response>;
+  handleApiExport(env: Env): Promise<Response>;
   handleApiHeat(env: Env): Promise<Response>;
   handleApiRecent(env: Env): Promise<Response>;
   handleApiInnerWeather(env: Env): Promise<Response>;
@@ -327,6 +328,7 @@ async function routeApiRequest(
     if (pathParts[1] === "health") return await handlers.handleApiHealth(env);
     if (pathParts[1] === "health-scores") return await handlers.handleApiHealthScores(env);
     if (pathParts[1] === "stats") return await handlers.handleApiStats(env);
+    if (pathParts[1] === "export") return await handlers.handleApiExport(env);
     if (pathParts[1] === "heat") return await handlers.handleApiHeat(env);
     if (pathParts[1] === "recent") return await handlers.handleApiRecent(env);
     if (pathParts[1] === "inner-weather") return await handlers.handleApiInnerWeather(env);

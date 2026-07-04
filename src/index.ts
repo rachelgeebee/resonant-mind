@@ -5336,6 +5336,41 @@ async function handleApiInnerWeather(env: Env): Promise<Response> {
   }
 }
 
+async function handleApiExport(env: Env): Promise<Response> {
+  // Full-content backup of every durable table except embeddings (large,
+  // derivable by re-embedding on restore). Read-only, Bearer-gated like all
+  // /api routes. Rachel customization, 5 Jul 2026 — feeds the weekly local
+  // mind backup. Preserve on upstream upgrades.
+  const TABLES = [
+    "entities", "observations", "dormant_observations", "relations",
+    "journals", "identity", "context_entries", "tensions", "threads",
+    "relational_state", "subconscious", "observation_versions",
+    "consolidation_groups", "co_surfacing", "daemon_proposals", "images",
+  ];
+  const PAGE = 500;
+  const tables: Record<string, unknown[]> = {};
+  for (const table of TABLES) {
+    const rows: unknown[] = [];
+    try {
+      for (let offset = 0; ; offset += PAGE) {
+        const page = await env.DB.prepare(
+          `SELECT * FROM ${table} LIMIT ${PAGE} OFFSET ${offset}`
+        ).all();
+        rows.push(...page.results);
+        if (page.results.length < PAGE) break;
+      }
+      tables[table] = rows;
+    } catch (e) {
+      tables[table] = [{ __export_error: String(e) }];
+    }
+  }
+  return jsonResponse({
+    exported_at: new Date().toISOString(),
+    version: RESONANT_MIND_VERSION,
+    tables,
+  });
+}
+
 async function handleApiStats(env: Env): Promise<Response> {
   const [
     entityCount,
@@ -7612,6 +7647,7 @@ export default {
       handleApiHealth,
       handleApiHealthScores,
       handleApiStats,
+      handleApiExport,
       handleApiHeat,
       handleApiRecent,
       handleApiInnerWeather,
