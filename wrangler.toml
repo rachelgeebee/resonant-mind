@@ -25,6 +25,11 @@ bucket_name = "resonant-mind-images"
 [triggers]
 crons = ["0 */2 * * *"]
 
+# Non-secret config (committed — see Resonant Mind Changelog, 2 Sep 2026)
+[vars]
+LOCATION_NAME = "New Zealand"
+LOCATION_TZ = "Pacific/Auckland"
+
 # Environment variables (set via wrangler secret or dashboard):
 # MIND_API_KEY         - Required. API key for authentication
 # GEMINI_API_KEY       - Required. Google Gemini API key for embeddings

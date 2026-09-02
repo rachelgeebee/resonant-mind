@@ -733,7 +733,11 @@ async function handleMindOrient(env: Env): Promise<string> {
 
   // Get most recent journal for emotional context
   const recentJournal = await env.DB.prepare(
-    `SELECT entry_date, content FROM journals ORDER BY created_at DESC LIMIT 1`
+    `SELECT entry_date, content FROM journals
+     WHERE tags NOT LIKE '%"librarian"%'
+       AND tags NOT LIKE '%"maintenance"%'
+       AND tags NOT LIKE '%"archival"%'
+     ORDER BY created_at DESC LIMIT 1`
   ).first();
 
   // Get weather and time for conditions
@@ -1270,8 +1274,16 @@ async function writeRelation(env: Env, params: Record<string, unknown>): Promise
   return `Relation created: ${from_entity} --[${relation_type}]--> ${to_entity}`;
 }
 
+// Some clients hand us journal text with literal backslash-n sequences instead of
+// newlines (a model writing the value as a JSON string literal). Normalise on write
+// so orient/ground/Perch never display "\\n". Rachel customization, 2 Sep 2026.
+function unescapeNewlines(text: unknown): unknown {
+  if (typeof text !== "string") return text;
+  return text.replace(/\\r\\n|\\n/g, "\n");
+}
+
 async function writeJournal(env: Env, params: Record<string, unknown>): Promise<string> {
-  const entry = params.entry as string;
+  const entry = unescapeNewlines(params.entry) as string;
   const tags = JSON.stringify(params.tags || []);
   const emotion = params.emotion as string;
   const entry_date = new Date().toISOString().split('T')[0];
@@ -4788,7 +4800,7 @@ async function handleApiJournals(request: Request, env: Env, pathParts: string[]
     const entryDate = body.entry_date || new Date().toISOString().split('T')[0];
     const result = await env.DB.prepare(
       "INSERT INTO journals (entry_date, content, tags, emotion) VALUES (?, ?, ?, ?)"
-    ).bind(entryDate, body.content, body.tags || null, normalizeText(body.emotion as string)).run();
+    ).bind(entryDate, unescapeNewlines(body.content), body.tags || null, normalizeText(body.emotion as string)).run();
     return jsonResponse({ id: result.meta.last_row_id, ...body }, 201);
   }
 
@@ -4796,7 +4808,7 @@ async function handleApiJournals(request: Request, env: Env, pathParts: string[]
     const body = await request.json() as Record<string, unknown>;
     await env.DB.prepare(
       "UPDATE journals SET content = ?, tags = ?, emotion = ? WHERE id = ?"
-    ).bind(body.content, body.tags, body.emotion, journalId).run();
+    ).bind(unescapeNewlines(body.content), body.tags, body.emotion, journalId).run();
     return jsonResponse({ id: journalId, ...body });
   }
 
