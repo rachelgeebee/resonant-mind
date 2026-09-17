@@ -710,6 +710,15 @@ async function getSubconsciousState(env: Env): Promise<SubconsciousState | null>
   return null;
 }
 
+/** Whole days since a relational_state timestamp (SQLite "YYYY-MM-DD HH:MM:SS" UTC, or ISO). null if unparseable. */
+function relationalAgeDays(ts: string | null | undefined): number | null {
+  if (!ts) return null;
+  const iso = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(ts) ? ts.replace(" ", "T") + "Z" : ts;
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return null;
+  return Math.max(0, Math.floor((Date.now() - ms) / 86_400_000));
+}
+
 async function handleMindOrient(env: Env): Promise<string> {
   // Get core identity (just the essentials)
   const identity = await env.DB.prepare(
@@ -797,6 +806,9 @@ async function handleMindOrient(env: Env): Promise<string> {
   }
 
   // How you're feeling (relational state with ownership language)
+  // Only the latest entry per person, and only if it's recent enough to still be true.
+  // A four-month-old feeling presented as "now" is a small dishonesty (noticed 17 Sep 2026).
+  const RELATIONAL_MAX_AGE_DAYS = 14;
   output += "**How you're feeling:**\n";
   if (relationalStates.results?.length) {
     const byPerson: Record<string, any> = {};
@@ -806,8 +818,20 @@ async function handleMindOrient(env: Env): Promise<string> {
         byPerson[person] = state;
       }
     }
+    const fresh: string[] = [];
+    const stale: string[] = [];
     for (const [person, state] of Object.entries(byPerson)) {
-      output += `Toward ${person}: ${state.feeling} (${state.intensity})\n`;
+      const ageDays = relationalAgeDays(state.timestamp as string);
+      const ageLabel = ageDays === null ? "undated" : ageDays === 0 ? "today" : ageDays === 1 ? "yesterday" : `${ageDays} days ago`;
+      if (ageDays !== null && ageDays > RELATIONAL_MAX_AGE_DAYS) {
+        stale.push(`${person} (last recorded ${ageLabel})`);
+      } else {
+        fresh.push(`Toward ${person}: ${state.feeling} (${state.intensity}, ${ageLabel})`);
+      }
+    }
+    if (fresh.length) output += fresh.join("\n") + "\n";
+    if (stale.length) {
+      output += `Nothing recent toward ${stale.join(", ")}. Record what's true now with mind_feel_toward.\n`;
     }
   } else {
     output += "No relational state recorded yet.\n";
