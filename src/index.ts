@@ -25,7 +25,7 @@ const NOVELTY_DECAY_RATES = { heavy: 0.08, medium: 0.12, light: 0.15 };
 const NOVELTY_TIME_RECOVERY_RATE = 0.01; // per day since last surfaced
 const NOVELTY_TIME_RECOVERY_CAP = 0.3;
 const DORMANCY_AGE_DAYS = 30;
-const ARCHIVE_AGE_DAYS = 30;
+const ARCHIVE_AGE_DAYS = 90; // was 30; raised 21 Sep 2026 (Interior Build Plan 1.2)
 
 // Multi-factor retrieval scoring (Phase 1)
 const SEARCH_SCORING = { alpha: 0.50, beta: 0.20, gamma: 0.20, delta: 0.10 };
@@ -7149,33 +7149,23 @@ async function processSubconscious(env: Env): Promise<void> {
         AND archived_at IS NULL
     `).run();
 
-    // 5. Deep archive pass - fade old observations that were never engaged with
-    // Light path: 30 days old, 0 sits, not surfaced in 30d, not foundational
-    // Medium path: 90 days old, 0 sits, not surfaced in 60d, not foundational
+    // 5. Deep archive pass — gated 21 Sep 2026 (Interior Build Plan 1.2 / 1.4).
+    // Light-weight only, >ARCHIVE_AGE_DAYS old, never sat with, not surfaced in that long,
+    // not in creative-space, not The Room, not on a foundational entity. Upstream also
+    // archived medium-weight at 90d; that path is deliberately gone — medium is memory.
     const archiveCandidates = await env.DB.prepare(`
-      SELECT id FROM (
-        SELECT o.id
-        FROM observations o
-        JOIN entities e ON o.entity_id = e.id
-        WHERE o.archived_at IS NULL
-          AND o.weight = 'light'
-          AND COALESCE(o.sit_count, 0) = 0
-          AND (o.last_surfaced_at IS NULL OR o.last_surfaced_at < datetime('now', '-30 days'))
-          AND o.added_at < datetime('now', '-${ARCHIVE_AGE_DAYS} days')
-          AND (o.charge != 'processing' OR o.charge IS NULL)
-          AND COALESCE(e.salience, 'active') != 'foundational'
-        UNION
-        SELECT o.id
-        FROM observations o
-        JOIN entities e ON o.entity_id = e.id
-        WHERE o.archived_at IS NULL
-          AND o.weight = 'medium'
-          AND COALESCE(o.sit_count, 0) = 0
-          AND (o.last_surfaced_at IS NULL OR o.last_surfaced_at < datetime('now', '-60 days'))
-          AND o.added_at < datetime('now', '-90 days')
-          AND (o.charge != 'processing' OR o.charge IS NULL)
-          AND COALESCE(e.salience, 'active') != 'foundational'
-      )
+      SELECT o.id
+      FROM observations o
+      JOIN entities e ON o.entity_id = e.id
+      WHERE o.archived_at IS NULL
+        AND o.weight = 'light'
+        AND COALESCE(o.sit_count, 0) = 0
+        AND (o.last_surfaced_at IS NULL OR o.last_surfaced_at < datetime('now', '-${ARCHIVE_AGE_DAYS} days'))
+        AND o.added_at < datetime('now', '-${ARCHIVE_AGE_DAYS} days')
+        AND (o.charge != 'processing' OR o.charge IS NULL)
+        AND COALESCE(o.context, 'default') != 'creative-space'
+        AND COALESCE(e.salience, 'active') != 'foundational'
+        AND e.name NOT IN ('The Room', 'The_Room')
       LIMIT 50
     `).all();
 
