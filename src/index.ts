@@ -7003,58 +7003,10 @@ async function processSubconscious(env: Env): Promise<void> {
       proposalsCreated++;
     }
 
-    // 1b. Entity-proximity proposals — rewritten 21 Sep 2026 (Interior Build Plan 1.1).
-    // Upstream's version used HAVING without GROUP BY, which D1 rejects; that one error
-    // killed the whole living-surface block on every run since 16 May 2026. Also: per-entity
-    // counts come from one CTE instead of two correlated subqueries per pair, foundational
-    // entities are excluded (Rachel/Theo relate to everything, so such proposals are noise),
-    // and each side needs 3+ live observations.
-    const proximityPairs = await env.DB.prepare(`
-      WITH ec AS (
-        SELECT entity_id, COUNT(*) AS c FROM observations
-        WHERE archived_at IS NULL GROUP BY entity_id
-      )
-      SELECT ea.id AS entity_a_id, eb.id AS entity_b_id,
-             ea.name AS entity_a_name, eb.name AS entity_b_name,
-             ca.c AS count_a, cb.c AS count_b
-      FROM entities ea
-      JOIN ec ca ON ca.entity_id = ea.id
-      JOIN entities eb ON eb.id > ea.id AND eb.name != ea.name
-      JOIN ec cb ON cb.entity_id = eb.id
-      WHERE ca.c >= 3 AND cb.c >= 3
-        AND COALESCE(ea.salience, 'active') != 'foundational'
-        AND COALESCE(eb.salience, 'active') != 'foundational'
-        AND NOT EXISTS (
-          SELECT 1 FROM relations r
-          WHERE (r.from_entity = ea.name AND r.to_entity = eb.name)
-             OR (r.from_entity = eb.name AND r.to_entity = ea.name)
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM daemon_proposals dp
-          WHERE dp.proposal_type = 'proximity'
-            AND ((dp.from_entity_id = ea.id AND dp.to_entity_id = eb.id)
-              OR (dp.from_entity_id = eb.id AND dp.to_entity_id = ea.id))
-        )
-      ORDER BY (ca.c + cb.c) DESC
-      LIMIT 5
-    `).all();
-
-    for (const pair of proximityPairs.results || []) {
-      const totalObs = (pair.count_a as number) + (pair.count_b as number);
-      const reason = `Entity proximity: ${pair.entity_a_name} (${pair.count_a} obs) and ${pair.entity_b_name} (${pair.count_b} obs) — ${totalObs} combined observations, no existing relation`;
-
-      await env.DB.prepare(`
-        INSERT INTO daemon_proposals
-        (proposal_type, from_entity_id, to_entity_id, reason, confidence)
-        VALUES ('proximity', ?, ?, ?, ?)
-      `).bind(
-        pair.entity_a_id, pair.entity_b_id,
-        reason,
-        Math.min(0.6, 0.3 + totalObs * 0.05)
-      ).run();
-
-      proposalsCreated++;
-    }
+    // 1b. (Removed 21 Sep 2026) Entity-proximity proposals. Once the query was made valid it
+    // paired the largest non-foundational entity with everything else ("The_Room and Daily_Health,
+    // no existing relation"). Two entities both being written about is not evidence of a relation.
+    // Co-surfacing proposals (step 1) stay — those are evidence-based.
 
     // 2. Get strongest co-surfacing pairs for orient display
     const topCoSurface = await env.DB.prepare(`
@@ -7107,17 +7059,18 @@ async function processSubconscious(env: Env): Promise<void> {
     dormantIdentified = (dormantInsert.meta?.changes as number) || 0;
 
     // 4. Idempotent novelty recalculation
-    // novelty = GREATEST(weight_floor, LEAST(1.0, base_decay + time_recovery))
+    // novelty = MAX(weight_floor, MIN(1.0, base_decay + time_recovery))
+    // (SQLite scalar MAX/MIN; upstream had the Postgres GREATEST and LEAST forms, which D1 rejects; fixed 21 Sep 2026)
     // Running this 1x or 48x produces the same result.
     await env.DB.prepare(`
       UPDATE observations
-      SET novelty_score = GREATEST(
+      SET novelty_score = MAX(
         CASE weight
           WHEN 'heavy' THEN ${NOVELTY_FLOORS.heavy}
           WHEN 'medium' THEN ${NOVELTY_FLOORS.medium}
           ELSE ${NOVELTY_FLOORS.light}
         END,
-        LEAST(1.0,
+        MIN(1.0,
           (1.0 - COALESCE(surface_count, 0) *
             CASE weight
               WHEN 'heavy' THEN ${NOVELTY_DECAY_RATES.heavy}
@@ -7126,7 +7079,7 @@ async function processSubconscious(env: Env): Promise<void> {
             END)
           + CASE
               WHEN last_surfaced_at IS NOT NULL
-              THEN LEAST(${NOVELTY_TIME_RECOVERY_CAP},
+              THEN MIN(${NOVELTY_TIME_RECOVERY_CAP},
                 (julianday('now') - julianday(last_surfaced_at)) * ${NOVELTY_TIME_RECOVERY_RATE})
               ELSE 0
             END
@@ -7191,7 +7144,7 @@ async function processSubconscious(env: Env): Promise<void> {
     try {
       await env.DB.prepare(`
         UPDATE observations
-        SET novelty_score = GREATEST(
+        SET novelty_score = MAX(
           CASE weight WHEN 'heavy' THEN 0.2 WHEN 'medium' THEN 0.1 ELSE 0.05 END,
           novelty_score - ${ACCESS_DECAY_PENALTY}
         )
