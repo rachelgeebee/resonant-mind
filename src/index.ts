@@ -7003,16 +7003,27 @@ async function processSubconscious(env: Env): Promise<void> {
       proposalsCreated++;
     }
 
-    // 1b. Entity-proximity proposals — entity pairs with 4+ combined observations but no relation
+    // 1b. Entity-proximity proposals — rewritten 21 Sep 2026 (Interior Build Plan 1.1).
+    // Upstream's version used HAVING without GROUP BY, which D1 rejects; that one error
+    // killed the whole living-surface block on every run since 16 May 2026. Also: per-entity
+    // counts come from one CTE instead of two correlated subqueries per pair, foundational
+    // entities are excluded (Rachel/Theo relate to everything, so such proposals are noise),
+    // and each side needs 3+ live observations.
     const proximityPairs = await env.DB.prepare(`
-      SELECT ea.id as entity_a_id, eb.id as entity_b_id,
-             ea.name as entity_a_name, eb.name as entity_b_name,
-             (SELECT COUNT(*) FROM observations WHERE entity_id = ea.id AND archived_at IS NULL) as count_a,
-             (SELECT COUNT(*) FROM observations WHERE entity_id = eb.id AND archived_at IS NULL) as count_b
+      WITH ec AS (
+        SELECT entity_id, COUNT(*) AS c FROM observations
+        WHERE archived_at IS NULL GROUP BY entity_id
+      )
+      SELECT ea.id AS entity_a_id, eb.id AS entity_b_id,
+             ea.name AS entity_a_name, eb.name AS entity_b_name,
+             ca.c AS count_a, cb.c AS count_b
       FROM entities ea
-      CROSS JOIN entities eb
-      WHERE ea.id < eb.id
-        AND ea.name != eb.name
+      JOIN ec ca ON ca.entity_id = ea.id
+      JOIN entities eb ON eb.id > ea.id AND eb.name != ea.name
+      JOIN ec cb ON cb.entity_id = eb.id
+      WHERE ca.c >= 3 AND cb.c >= 3
+        AND COALESCE(ea.salience, 'active') != 'foundational'
+        AND COALESCE(eb.salience, 'active') != 'foundational'
         AND NOT EXISTS (
           SELECT 1 FROM relations r
           WHERE (r.from_entity = ea.name AND r.to_entity = eb.name)
@@ -7024,8 +7035,7 @@ async function processSubconscious(env: Env): Promise<void> {
             AND ((dp.from_entity_id = ea.id AND dp.to_entity_id = eb.id)
               OR (dp.from_entity_id = eb.id AND dp.to_entity_id = ea.id))
         )
-      HAVING (count_a + count_b) >= 4
-      ORDER BY (count_a + count_b) DESC
+      ORDER BY (ca.c + cb.c) DESC
       LIMIT 5
     `).all();
 
@@ -7081,7 +7091,10 @@ async function processSubconscious(env: Env): Promise<void> {
     // Previously the predicate `last_surfaced_at IS NULL OR surface_count = 0` was degenerate (those
     // conditions are equivalent), so once an observation surfaced once it could never re-enter the
     // dormant list even if it then went cold for years. The age check below is the real signal.
-    const dormantRows = await env.DB.prepare(`
+    // One statement instead of a per-row loop (21 Sep 2026): the first real run marks
+    // a few thousand rows, which as individual inserts would take minutes.
+    const dormantInsert = await env.DB.prepare(`
+      INSERT OR IGNORE INTO dormant_observations (observation_id)
       SELECT o.id FROM observations o
       LEFT JOIN dormant_observations doo ON o.id = doo.observation_id
       WHERE (o.last_surfaced_at IS NULL OR o.last_surfaced_at < datetime('now', '-${DORMANCY_AGE_DAYS} days'))
@@ -7090,14 +7103,8 @@ async function processSubconscious(env: Env): Promise<void> {
         AND (o.charge != 'metabolized' OR o.charge IS NULL)
         AND o.weight IN ('medium', 'heavy')
         AND o.archived_at IS NULL
-    `).all();
-
-    for (const row of dormantRows.results || []) {
-      await env.DB.prepare(`
-        INSERT OR IGNORE INTO dormant_observations (observation_id) VALUES (?)
-      `).bind(row.id).run();
-      dormantIdentified++;
-    }
+    `).run();
+    dormantIdentified = (dormantInsert.meta?.changes as number) || 0;
 
     // 4. Idempotent novelty recalculation
     // novelty = GREATEST(weight_floor, LEAST(1.0, base_decay + time_recovery))
