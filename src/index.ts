@@ -1755,6 +1755,28 @@ async function handleMindIdentity(env: Env, params: Record<string, unknown>): Pr
   }
 }
 
+// Session-context expiry (Rachel customization; rewritten 21 Sep 2026 — Interior Build Plan 0.2).
+// Runs on every context read AND write, from the REST list, and from the daemon, so stale rows
+// cannot accumulate when nobody calls `read` (they piled up to 500+ before this).
+// Uses SQLite datetime arithmetic so the comparison matches the `datetime('now')` format
+// `updated_at` is stored in. The previous ISO-string cutoff (`YYYY-MM-DDTHH:MM:SS.sssZ`)
+// sorted *before* any same-day `YYYY-MM-DD HH:MM:SS` value, so a `read` deleted fresh
+// same-day presence entries. ISO-formatted rows are normalised in the WHERE for safety.
+const CONTEXT_TTL_HOURS: Record<string, number> = { 'session-presence': 4, 'session': 24 };
+
+async function expireStaleContext(env: Env): Promise<number> {
+  let deleted = 0;
+  for (const [scope, hours] of Object.entries(CONTEXT_TTL_HOURS)) {
+    const r = await env.DB.prepare(
+      `DELETE FROM context_entries
+       WHERE scope = ?
+         AND replace(substr(updated_at, 1, 19), 'T', ' ') < datetime('now', ?)`
+    ).bind(scope, `-${hours} hours`).run();
+    deleted += (r.meta?.changes as number) || 0;
+  }
+  return deleted;
+}
+
 async function handleMindContext(env: Env, params: Record<string, unknown>): Promise<string> {
   const action = (params.action as string) || "read";
 
@@ -1764,11 +1786,7 @@ async function handleMindContext(env: Env, params: Record<string, unknown>): Pro
 
       // Auto-expire stale session entries before reading
       const now = Date.now();
-      const fourHoursAgo = new Date(now - 4 * 60 * 60 * 1000).toISOString();
-      const twentyFourHoursAgo = new Date(now - 24 * 60 * 60 * 1000).toISOString();
-      await env.DB.prepare(
-        `DELETE FROM context_entries WHERE (scope = 'session-presence' AND updated_at < ?) OR (scope = 'session' AND updated_at < ?)`
-      ).bind(fourHoursAgo, twentyFourHoursAgo).run();
+      await expireStaleContext(env);
 
       const query = scope
         ? `SELECT * FROM context_entries WHERE scope = ? ORDER BY updated_at DESC LIMIT 200`
@@ -1803,6 +1821,9 @@ async function handleMindContext(env: Env, params: Record<string, unknown>): Pro
       const scope = params.scope as string;
       const content = params.content as string;
       const links = params.links || "[]";
+
+      // Expire on write too — most presence writers (Resonant, wakes) never call read.
+      await expireStaleContext(env);
 
       await env.DB.prepare(
         `INSERT INTO context_entries (id, scope, content, links) VALUES (?, ?, ?, ?)`
@@ -5158,6 +5179,7 @@ async function handleApiContext(request: Request, env: Env, pathParts: string[])
 
   // GET /api/context - list all or filter by scope
   if (method === "GET" && !contextId) {
+    await expireStaleContext(env);
     let query = "SELECT * FROM context_entries";
     const bindings: unknown[] = [];
 
@@ -7010,6 +7032,15 @@ async function processSubconscious(env: Env): Promise<void> {
       }
     }
   } catch { /* table may not exist yet */ }
+
+  // Housekeeping: expire stale session context. Sits outside the living-surface
+  // try-block below so it runs even when that block throws.
+  try {
+    const expired = await expireStaleContext(env);
+    if (expired > 0) console.log(`Expired ${expired} stale context entries`);
+  } catch (e) {
+    console.log(`Context expiry error: ${e}`);
+  }
 
   const cutoffHours = 48;
   const cutoff = new Date(now.getTime() - cutoffHours * 60 * 60 * 1000);
