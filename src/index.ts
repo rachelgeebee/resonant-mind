@@ -792,7 +792,7 @@ async function handleMindOrient(env: Env): Promise<string> {
       const lastMin = Math.max(0, Math.floor(lastMs / 60000));
       const lastAge = lastMin < 60 ? `${lastMin}m ago` : `${Math.floor(lastMin / 60)}h ${lastMin % 60}m ago`;
       const errored = runs.filter(r => !r.ok);
-      let line = `**Moved in the last 24h:** ${parts.length ? parts.join(", ") : "nothing"} (${runs.length} runs, last ${lastAge})`;
+      let line = `**Moved in the last 24h:** ${parts.length ? parts.join(", ") : "nothing"} (${runs.length} run${runs.length === 1 ? "" : "s"}, last ${lastAge})`;
       if (errored.length) {
         line += ` \u26A0 ${errored.length} errored — last error: ${String(errored[0].error || "").slice(0, 100)}`;
       }
@@ -1920,7 +1920,7 @@ async function handleMindHealth(env: Env): Promise<string> {
     }
     const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
     const agg = await env.DB.prepare(`SELECT COUNT(*) AS n, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS errs FROM daemon_runs WHERE started_at > ?`).bind(sinceIso).first();
-    if (agg) daemonRuns24Line = `${agg.n || 0} runs, ${agg.errs || 0} errored`;
+    if (agg) daemonRuns24Line = `${agg.n || 0} run${Number(agg.n) === 1 ? "" : "s"}, ${agg.errs || 0} errored`;
   } catch { /* daemon_runs may not exist yet */ }
 
   const [
