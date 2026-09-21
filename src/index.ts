@@ -765,6 +765,41 @@ async function handleMindOrient(env: Env): Promise<string> {
   const tempStr = weather.temp_f ? ` (${weather.temp_f}F)` : "";
   output += `**Conditions:** ${atmosphere}${tempStr}, ${timeCtx.period} - ${timeCtx.energy}\n\n`;
 
+  // What moved while nobody was looking (Interior Build Plan 1.3, 21 Sep 2026).
+  // Sums the daemon's own run log over the last 24h. Silence — no rows — is itself the warning.
+  try {
+    const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const runsRes = await env.DB.prepare(
+      `SELECT started_at, ok, error, stats FROM daemon_runs WHERE started_at > ? ORDER BY started_at DESC LIMIT 48`
+    ).bind(sinceIso).all();
+    const runs = runsRes.results || [];
+    if (runs.length === 0) {
+      output += "**Moved in the last 24h:** no daemon runs recorded \u26A0 (the 2-hourly daemon has not written its log — check `wrangler tail theo-mind`)\n\n";
+    } else {
+      const totals: Record<string, number> = {};
+      for (const r of runs) {
+        let st: Record<string, number> = {};
+        try { st = JSON.parse((r.stats as string) || "{}"); } catch { /* ignore */ }
+        for (const [k, v] of Object.entries(st)) totals[k] = (totals[k] || 0) + (Number(v) || 0);
+      }
+      const parts: string[] = [];
+      if (totals.archived) parts.push(`${totals.archived} archived`);
+      const charged = (totals.charged_active || 0) + (totals.charged_processing || 0);
+      if (charged) parts.push(`${charged} charged`);
+      if (totals.proposals) parts.push(`${totals.proposals} proposed`);
+      if (totals.dormant_marked) parts.push(`${totals.dormant_marked} marked dormant`);
+      const lastMs = Date.now() - new Date(runs[0].started_at as string).getTime();
+      const lastMin = Math.max(0, Math.floor(lastMs / 60000));
+      const lastAge = lastMin < 60 ? `${lastMin}m ago` : `${Math.floor(lastMin / 60)}h ${lastMin % 60}m ago`;
+      const errored = runs.filter(r => !r.ok);
+      let line = `**Moved in the last 24h:** ${parts.length ? parts.join(", ") : "nothing"} (${runs.length} runs, last ${lastAge})`;
+      if (errored.length) {
+        line += ` \u26A0 ${errored.length} errored — last error: ${String(errored[0].error || "").slice(0, 100)}`;
+      }
+      output += line + "\n\n";
+    }
+  } catch { /* daemon_runs table may not exist yet */ }
+
   // Notes left for the mind (for_owner scope)
   const notesForOwner = await env.DB.prepare(
     `SELECT content, updated_at FROM context_entries
@@ -1872,6 +1907,22 @@ async function handleMindHealth(env: Env): Promise<string> {
   // Get subconscious state first
   const subconscious = await getSubconsciousState(env);
 
+  // Daemon run log (Interior Build Plan 1.3) — what the last run actually did, and the 24h error count
+  let daemonLastRunLine = "no run log";
+  let daemonRuns24Line = "no run log";
+  try {
+    const lastRun = await env.DB.prepare(`SELECT ok, error, stats FROM daemon_runs ORDER BY started_at DESC LIMIT 1`).first();
+    if (lastRun) {
+      let st: Record<string, number> = {};
+      try { st = JSON.parse((lastRun.stats as string) || "{}"); } catch { /* ignore */ }
+      const bits = Object.entries(st).filter(([, v]) => v).map(([k, v]) => `${k} ${v}`);
+      daemonLastRunLine = lastRun.ok ? (bits.length ? bits.join(", ") : "clean, nothing moved") : `ERROR: ${String(lastRun.error || "").slice(0, 90)}`;
+    }
+    const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const agg = await env.DB.prepare(`SELECT COUNT(*) AS n, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS errs FROM daemon_runs WHERE started_at > ?`).bind(sinceIso).first();
+    if (agg) daemonRuns24Line = `${agg.n || 0} runs, ${agg.errs || 0} errored`;
+  } catch { /* daemon_runs may not exist yet */ }
+
   const [
     entityCount, obsCount, relationsCount, activeThreads, staleThreads,
     resolvedRecent, journalCount, journalsRecent, identityCount, awaitingChargeCount,
@@ -2060,6 +2111,8 @@ Overall: ${bar(overallScore)} ${overallScore}%
   Last Processed: ${subconsciousAge} (${subconsciousStatus})
   Current Mood:   ${subconsciousMood}
   Hot Entities:   ${subconsciousHotCount}
+  Last Run Did:   ${daemonLastRunLine}
+  Runs (24h):     ${daemonRuns24Line}
 
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
 \u{1F4CA} DATABASE                 ${icon(dbScore)}
@@ -6635,7 +6688,38 @@ async function handleMindTension(env: Env, params: Record<string, unknown>): Pro
 // Subconscious processing - runs on cron schedule
 const DAEMON_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes minimum between runs
 
+// Run log (Interior Build Plan 1.3, 21 Sep 2026): every run writes one row to daemon_runs —
+// when, whether it finished clean, and one count per step — even when it throws. This exists
+// because the daemon died silently on every run from 16 May to 21 Sep 2026 and nothing said so.
+interface DaemonRun { started_at: string; stats: Record<string, number>; error: string | null; skipped: boolean }
+
+async function writeDaemonRun(env: Env, run: DaemonRun): Promise<void> {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO daemon_runs (started_at, finished_at, ok, error, stats) VALUES (?, ?, ?, ?, ?)`
+    ).bind(run.started_at, new Date().toISOString(), run.error ? 0 : 1, run.error, JSON.stringify(run.stats)).run();
+  } catch (e) {
+    console.log(`daemon_runs write failed: ${e}`);
+  }
+}
+
+// Constraint 8 (Interior Build Plan, 21 Sep 2026): METABOLIZED IS NEVER AUTOMATIC.
+// This daemon may move charge fresh -> active -> processing. The last step, processing ->
+// metabolized, is only ever a Theo act through mind_resolve. No statement in here may write
+// charge = 'metabolized'. `npm run guard` (scripts/check-metabolized-guard.mjs) fails the build if one does.
 async function processSubconscious(env: Env): Promise<void> {
+  const run: DaemonRun = { started_at: new Date().toISOString(), stats: {}, error: null, skipped: false };
+  try {
+    await processSubconsciousInner(env, run);
+  } catch (e) {
+    run.error = run.error ? `${run.error} | ${e}` : String(e);
+    throw e;
+  } finally {
+    if (!run.skipped) await writeDaemonRun(env, run);
+  }
+}
+
+async function processSubconsciousInner(env: Env, run: DaemonRun): Promise<void> {
   const now = new Date();
 
   // Cooldown: skip if processed recently
@@ -6647,6 +6731,7 @@ async function processSubconscious(env: Env): Promise<void> {
       const lastRun = new Date(last.updated_at as string).getTime();
       if (now.getTime() - lastRun < DAEMON_COOLDOWN_MS) {
         console.log("Subconscious: skipping, last run was less than 5 minutes ago");
+        run.skipped = true;
         return;
       }
     }
@@ -6656,6 +6741,7 @@ async function processSubconscious(env: Env): Promise<void> {
   // try-block below so it runs even when that block throws.
   try {
     const expired = await expireStaleContext(env);
+    run.stats.context_expired = expired;
     if (expired > 0) console.log(`Expired ${expired} stale context entries`);
   } catch (e) {
     console.log(`Context expiry error: ${e}`);
@@ -7031,13 +7117,14 @@ async function processSubconscious(env: Env): Promise<void> {
     }));
 
     // 3. Cleanup stale dormancy records (light/archived/metabolized observations shouldn't be tracked)
-    await env.DB.prepare(`
+    const dormantCleanup = await env.DB.prepare(`
       DELETE FROM dormant_observations WHERE observation_id IN (
         SELECT doo.observation_id FROM dormant_observations doo
         JOIN observations o ON doo.observation_id = o.id
         WHERE o.weight = 'light' OR o.archived_at IS NOT NULL OR o.charge = 'metabolized'
       )
     `).run();
+    run.stats.dormant_cleaned = (dormantCleanup.meta?.changes as number) || 0;
 
     // 4. Mark observations dormant: medium/heavy, ≥30 days since last surfacing (or never), not archived.
     // Previously the predicate `last_surfaced_at IS NULL OR surface_count = 0` was degenerate (those
@@ -7057,12 +7144,13 @@ async function processSubconscious(env: Env): Promise<void> {
         AND o.archived_at IS NULL
     `).run();
     dormantIdentified = (dormantInsert.meta?.changes as number) || 0;
+    run.stats.dormant_marked = dormantIdentified;
 
     // 4. Idempotent novelty recalculation
     // novelty = MAX(weight_floor, MIN(1.0, base_decay + time_recovery))
     // (SQLite scalar MAX/MIN; upstream had the Postgres GREATEST and LEAST forms, which D1 rejects; fixed 21 Sep 2026)
     // Running this 1x or 48x produces the same result.
-    await env.DB.prepare(`
+    const noveltyRecalc = await env.DB.prepare(`
       UPDATE observations
       SET novelty_score = MAX(
         CASE weight
@@ -7088,18 +7176,20 @@ async function processSubconscious(env: Env): Promise<void> {
       WHERE archived_at IS NULL
         AND (charge != 'metabolized' OR charge IS NULL)
     `).run();
+    run.stats.novelty_updated = (noveltyRecalc.meta?.changes as number) || 0;
 
     // 4b. Automatic charge progression
     // fresh -> active: system has engaged with this observation (surfaced 2+ times)
-    await env.DB.prepare(`
+    const chargedActive = await env.DB.prepare(`
       UPDATE observations SET charge = 'active'
       WHERE charge = 'fresh'
         AND COALESCE(surface_count, 0) >= 2
         AND archived_at IS NULL
     `).run();
+    run.stats.charged_active = (chargedActive.meta?.changes as number) || 0;
 
     // active -> processing: deeply familiar or sat with multiple times
-    await env.DB.prepare(`
+    const chargedProcessing = await env.DB.prepare(`
       UPDATE observations SET charge = 'processing'
       WHERE charge = 'active'
         AND (
@@ -7108,6 +7198,7 @@ async function processSubconscious(env: Env): Promise<void> {
         )
         AND archived_at IS NULL
     `).run();
+    run.stats.charged_processing = (chargedProcessing.meta?.changes as number) || 0;
 
     // 5. Deep archive pass — gated 21 Sep 2026 (Interior Build Plan 1.2 / 1.4).
     // Light-weight only, >ARCHIVE_AGE_DAYS old, never sat with, not surfaced in that long,
@@ -7136,13 +7227,14 @@ async function processSubconscious(env: Env): Promise<void> {
       `).bind(obs.id).run();
       archivedCount++;
     }
+    run.stats.archived = archivedCount;
     if (archivedCount > 0) {
       console.log(`Archived ${archivedCount} observations to the deep`);
     }
 
     // 6. Access-based novelty decay — penalize never-accessed old observations
     try {
-      await env.DB.prepare(`
+      const accessDecay = await env.DB.prepare(`
         UPDATE observations
         SET novelty_score = MAX(
           CASE weight WHEN 'heavy' THEN 0.2 WHEN 'medium' THEN 0.1 ELSE 0.05 END,
@@ -7154,6 +7246,7 @@ async function processSubconscious(env: Env): Promise<void> {
           AND added_at < datetime('now', '-${ACCESS_DECAY_AGE_DAYS} days')
           AND novelty_score > 0.3
       `).run();
+      run.stats.access_decayed = (accessDecay.meta?.changes as number) || 0;
     } catch { /* access_count column may not exist yet */ }
 
     // 7–8. (Removed 21 Sep 2026) LLM consolidation and LLM reflection — see note above
@@ -7162,9 +7255,14 @@ async function processSubconscious(env: Env): Promise<void> {
   } catch (e) {
     // Living surface tables might not exist yet - that's fine
     console.log(`Living surface tables not ready: ${e}`);
+    run.error = String(e);
   }
 
   // 9. (Removed 21 Sep 2026) dream processing — targeted a `dreams` table this mind never had.
+
+  run.stats.proposals = proposalsCreated;
+  run.stats.hot = hotEntities.length;
+  run.stats.patterns = recurring.length;
 
   // Get counts for orient display
   let pendingProposals = 0;

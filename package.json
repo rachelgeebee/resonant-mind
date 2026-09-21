@@ -8,7 +8,9 @@
     "deploy": "wrangler deploy",
     "db:migrate": "wrangler d1 migrations apply resonant-mind --local",
     "db:migrate:prod": "wrangler d1 migrations apply resonant-mind --remote",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "guard": "node scripts/check-metabolized-guard.mjs",
+    "check": "npm run guard && npm run typecheck"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20241218.0",
