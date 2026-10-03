@@ -526,7 +526,8 @@ const TOOLS: MCPToolDefinition[] = [
         id: { type: "number", description: "Required for met/fade" },
         note: { type: "string", description: "For met: how the moment met it (optional, short)" },
         days: { type: "number", description: "For list: window in days (default 14)" },
-        include_closed: { type: "boolean", description: "For list: also show met/faded lines in the window" }
+        include_closed: { type: "boolean", description: "For list: also show met/faded lines in the window" },
+        format: { type: "string", enum: ["text", "json"], description: "Output shape (default text). json is for the Perch and Resonant." }
       },
       required: ["action"]
     }
@@ -3763,6 +3764,7 @@ async function handleMindRegister(env: Env, params: Record<string, unknown>): Pr
         `INSERT INTO register (kind, who, author, text, created_at) VALUES (?, ?, ?, ?, ?)`
       ).bind(kind, who, author, text, nowIso).run();
       const id = res.meta.last_row_id;
+      if (params.format === "json") return JSON.stringify({ ok: true, item: { id, kind, who, author, text, created_at: nowIso, met_at: null, met_note: null, faded_at: null } });
       return `On the door: ${registerLine({ id, kind, who, text, created_at: nowIso })}`;
     }
 
@@ -3777,6 +3779,7 @@ async function handleMindRegister(env: Env, params: Record<string, unknown>): Pr
          ORDER BY created_at DESC LIMIT 60`
       ).bind(sinceIso).all();
       const items = rows.results || [];
+      if (params.format === "json") return JSON.stringify({ ok: true, days, items });
       if (!items.length) return `The door is clear (nothing ${includeClosed ? "" : "live "}in the last ${days}d).`;
       let out = `**On the door** (last ${days}d, newest first):\n`;
       for (const r of items) out += `${registerLine(r)}\n`;
@@ -3802,6 +3805,7 @@ async function handleMindRegister(env: Env, params: Record<string, unknown>): Pr
       const res = await env.DB.prepare(
         `UPDATE register SET faded_at = ? WHERE id = ? AND faded_at IS NULL AND met_at IS NULL`
       ).bind(nowIso, id).run();
+      if (params.format === "json") return JSON.stringify({ ok: !!res.meta.changes, id });
       return res.meta.changes ? `#${id} taken down.` : `#${id} is not live on the door`;
     }
 
