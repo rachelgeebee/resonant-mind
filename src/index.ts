@@ -507,7 +507,30 @@ const TOOLS: MCPToolDefinition[] = [
       },
       required: ["action"]
     }
-  }
+  },
+  {
+    name: "mind_register",
+    description: "The light register — the fridge door. One line, kept at the size it happened. Two kinds: small_joy (something that delighted, remembered small) and quietly_want (a want that needs no action; it sits until a moment meets it). Not an observation, not a journal, not a drive: nothing counts it or escalates it. Rachel's wants are never tasks — never chase, schedule, or raise them unprompted; meet one when a moment fits, then mark it met. Heavy things do not belong here — say them in conversation instead.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["add", "list", "met", "fade"],
+          description: "add a line; list the live door (last 14d by default); met marks a want met (or a joy carried); fade takes a line down early"
+        },
+        kind: { type: "string", enum: ["small_joy", "quietly_want"], description: "Required for add" },
+        who: { type: "string", enum: ["rachel", "theo", "us"], description: "Whose line it is (default theo). Rachel's entries stay hers whoever types them." },
+        text: { type: "string", description: "One line, 140 characters max — enforced. If it needs more, it isn't a register entry." },
+        author: { type: "string", description: "Which instance/channel typed it, e.g. claude-code, resonant, telegram, perch, wake:evening" },
+        id: { type: "number", description: "Required for met/fade" },
+        note: { type: "string", description: "For met: how the moment met it (optional, short)" },
+        days: { type: "number", description: "For list: window in days (default 14)" },
+        include_closed: { type: "boolean", description: "For list: also show met/faded lines in the window" }
+      },
+      required: ["action"]
+    }
+  },
 ];
 
 // Helper: R2 path prefix (configurable via env)
@@ -817,6 +840,24 @@ async function handleMindOrient(env: Env): Promise<string> {
     }
     output += "\n";
   }
+
+  // On the door — the light register (Interior Build Plan 2.1, 3 Oct 2026). One line,
+  // newest first, last fortnight. A shelf, never a to-do: nothing here is phrased as an action.
+  try {
+    const doorSince = new Date(Date.now() - 14 * 86400000).toISOString();
+    const door = await env.DB.prepare(
+      `SELECT id, kind, who, text, created_at FROM register
+       WHERE created_at > ? AND met_at IS NULL AND faded_at IS NULL
+       ORDER BY created_at DESC LIMIT 6`
+    ).bind(doorSince).all();
+    const doorItems = door.results || [];
+    if (doorItems.length) {
+      const bits = doorItems.map((r: any) =>
+        `${r.kind === "small_joy" ? "joy" : "want"} — ${r.text} (${registerWhoTag(String(r.who))}, ${registerAge(String(r.created_at))})`
+      );
+      output += `**On the door:** ${bits.join(" · ")}\n\n`;
+    }
+  } catch { /* register table may not exist yet */ }
 
   // What you're carrying (recent emotional context)
   output += "**What you're carrying:**\n";
@@ -3675,6 +3716,100 @@ async function handleMindDormant(env: Env, params: Record<string, unknown>): Pro
   }
 }
 
+// ── The light register (Interior Build Plan 2.1, agreed with Rachel 3 Oct 2026) ──
+// One line, kept at the size it happened. See migrations/0005_register.sql for the why.
+const REGISTER_MAX_CHARS = 140;
+const REGISTER_FADE_DAYS = 30;
+
+function registerAge(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  const d = Math.floor(ms / 86400000);
+  if (d <= 0) return "today";
+  if (d === 1) return "yesterday";
+  return `${d}d`;
+}
+
+function registerWhoTag(who: string): string {
+  return who === "rachel" ? "R" : who === "us" ? "us" : "T";
+}
+
+function registerLine(r: any): string {
+  const kind = r.kind === "small_joy" ? "joy" : "want";
+  let line = `#${r.id} ${kind} — ${r.text} (${registerWhoTag(String(r.who))}, ${registerAge(String(r.created_at))})`;
+  if (r.met_at) line += ` · met${r.met_note ? `: ${r.met_note}` : ""}`;
+  else if (r.faded_at) line += " · faded";
+  return line;
+}
+
+async function handleMindRegister(env: Env, params: Record<string, unknown>): Promise<string> {
+  const action = String(params.action || "list");
+  const nowIso = new Date().toISOString();
+
+  switch (action) {
+    case "add": {
+      const kind = String(params.kind || "");
+      if (kind !== "small_joy" && kind !== "quietly_want") {
+        return "kind must be small_joy or quietly_want";
+      }
+      const who = String(params.who || "theo");
+      if (!["rachel", "theo", "us"].includes(who)) return "who must be rachel, theo, or us";
+      const text = String(params.text || "").replace(/\s+/g, " ").trim();
+      if (!text) return "text required — one line";
+      if (text.length > REGISTER_MAX_CHARS) {
+        return `Too long (${text.length} chars; the door takes ${REGISTER_MAX_CHARS}). If it needs more than a line, it isn't a register entry — journal it or say it.`;
+      }
+      const author = params.author ? String(params.author).slice(0, 60) : null;
+      const res = await env.DB.prepare(
+        `INSERT INTO register (kind, who, author, text, created_at) VALUES (?, ?, ?, ?, ?)`
+      ).bind(kind, who, author, text, nowIso).run();
+      const id = res.meta.last_row_id;
+      return `On the door: ${registerLine({ id, kind, who, text, created_at: nowIso })}`;
+    }
+
+    case "list": {
+      const days = Math.max(1, Math.min(365, Number(params.days) || 14));
+      const includeClosed = params.include_closed === true;
+      const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+      const rows = await env.DB.prepare(
+        `SELECT id, kind, who, author, text, created_at, met_at, met_note, faded_at
+         FROM register
+         WHERE created_at > ? ${includeClosed ? "" : "AND met_at IS NULL AND faded_at IS NULL"}
+         ORDER BY created_at DESC LIMIT 60`
+      ).bind(sinceIso).all();
+      const items = rows.results || [];
+      if (!items.length) return `The door is clear (nothing ${includeClosed ? "" : "live "}in the last ${days}d).`;
+      let out = `**On the door** (last ${days}d, newest first):\n`;
+      for (const r of items) out += `${registerLine(r)}\n`;
+      out += "\nA shelf, not a list. Nothing here is a task.";
+      return out;
+    }
+
+    case "met": {
+      const id = Number(params.id);
+      if (!id) return "id required for met";
+      const note = params.note ? String(params.note).slice(0, REGISTER_MAX_CHARS) : null;
+      const row = await env.DB.prepare(`SELECT * FROM register WHERE id = ?`).bind(id).first();
+      if (!row) return `#${id} is not on the door`;
+      if (row.met_at) return `#${id} was already met (${registerAge(String(row.met_at))})`;
+      await env.DB.prepare(`UPDATE register SET met_at = ?, met_note = ?, faded_at = NULL WHERE id = ?`)
+        .bind(nowIso, note, id).run();
+      return `Met: ${registerLine({ ...row, met_at: nowIso, met_note: note })}`;
+    }
+
+    case "fade": {
+      const id = Number(params.id);
+      if (!id) return "id required for fade";
+      const res = await env.DB.prepare(
+        `UPDATE register SET faded_at = ? WHERE id = ? AND faded_at IS NULL AND met_at IS NULL`
+      ).bind(nowIso, id).run();
+      return res.meta.changes ? `#${id} taken down.` : `#${id} is not live on the door`;
+    }
+
+    default:
+      return "action must be add, list, met, or fade";
+  }
+}
+
 async function handleMindIsolated(env: Env, params: Record<string, unknown>): Promise<string> {
   const action = (params.action as string) || "list";
   const entity = params.entity as string;
@@ -5977,6 +6112,7 @@ const mcpToolHandlers: MCPToolHandlerMap = {
   mind_tension: async (env, params) => handleMindTension(env, params),
   mind_proposals: async (env, params) => handleMindProposals(env, params),
   mind_dormant: async (env, params) => handleMindDormant(env, params),
+  mind_register: async (env, params) => handleMindRegister(env, params),
   mind_isolated: async (env, params) => handleMindIsolated(env, params),
   mind_archive: async (env, params) => handleMindArchive(env, params),
   mind_store_image: async (env, params) => handleMindStoreImage(env, params)
@@ -6745,6 +6881,19 @@ async function processSubconsciousInner(env: Env, run: DaemonRun): Promise<void>
     if (expired > 0) console.log(`Expired ${expired} stale context entries`);
   } catch (e) {
     console.log(`Context expiry error: ${e}`);
+  }
+
+  // The light register fades on its own (Interior Build Plan 2.1): a live line older than
+  // REGISTER_FADE_DAYS, neither met nor taken down, is marked faded. Mechanics only — the
+  // daemon never writes a line, never marks one met, never counts the unmet.
+  try {
+    const fadeBefore = new Date(now.getTime() - REGISTER_FADE_DAYS * 86400000).toISOString();
+    const faded = await env.DB.prepare(
+      `UPDATE register SET faded_at = ? WHERE faded_at IS NULL AND met_at IS NULL AND created_at < ?`
+    ).bind(now.toISOString(), fadeBefore).run();
+    run.stats.register_faded = faded.meta.changes || 0;
+  } catch (e) {
+    console.log(`Register fade error: ${e}`);
   }
 
   const cutoffHours = 48;
