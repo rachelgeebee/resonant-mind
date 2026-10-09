@@ -1391,15 +1391,20 @@ async function writeJournal(env: Env, params: Record<string, unknown>): Promise<
   ).bind(entry_date, entry, tags, normalizeText(emotion)).run();
 
   const journalId = `journal-${result.meta.last_row_id}`;
-  const embedding = await getEmbedding(env, entry);
-  const journalMetadata: Record<string, string> = {
-    source: "journal", title: entry_date, content: entry, added_at: new Date().toISOString()
-  };
-  if (emotion) journalMetadata.emotion = normalizeText(emotion) || emotion;
+  try {
+    const embedding = await getEmbedding(env, entry);
+    const journalMetadata: Record<string, string> = {
+      source: "journal", title: entry_date, content: entry, added_at: new Date().toISOString()
+    };
+    if (emotion) journalMetadata.emotion = normalizeText(emotion) || emotion;
 
-  await env.VECTORS.upsert([{
-    id: journalId, values: embedding, metadata: journalMetadata
-  }]);
+    await env.VECTORS.upsert([{
+      id: journalId, values: embedding, metadata: journalMetadata
+    }]);
+  } catch (e) {
+    // Row landed in D1 — don't throw and cause duplicates on retry
+    return `Journal entry recorded for ${entry_date} (not vectorized — embedding failed)`;
+  }
 
   return `Journal entry recorded for ${entry_date} (vectorized)`;
 }
