@@ -1308,6 +1308,7 @@ async function writeObservation(env: Env, params: Record<string, unknown>): Prom
   }
 
   let totalSuperseded = 0;
+  const notVectorized: number[] = [];
 
   for (const obs of observations) {
     // Phase 2: Check for contradictions before writing
@@ -1322,16 +1323,24 @@ async function writeObservation(env: Env, params: Record<string, unknown>): Prom
 
     const newRowId = result.meta.last_row_id;
     const obsId = `obs-${entity!.id}-${newRowId}`;
-    const embedding = await getEmbedding(env, `${entity_name}: ${obs}`);
-    await env.VECTORS.upsert([{
-      id: obsId,
-      values: embedding,
-      metadata: {
-        source: "observation", entity: entity_name, content: obs, context,
-        weight: (params.weight as string) || "medium", certainty: (params.certainty as string) || "believed",
-        observation_source: (params.source as string) || "conversation", added_at: new Date().toISOString()
-      }
-    }]);
+    // Row is already in D1. If Gemini or Vectorize fails here, do NOT throw —
+    // a -32603 makes the caller retry and the retry lands a duplicate row
+    // (11 Oct 2026: three copies of one observation from one librarian run).
+    try {
+      const embedding = await getEmbedding(env, `${entity_name}: ${obs}`);
+      await env.VECTORS.upsert([{
+        id: obsId,
+        values: embedding,
+        metadata: {
+          source: "observation", entity: entity_name, content: obs, context,
+          weight: (params.weight as string) || "medium", certainty: (params.certainty as string) || "believed",
+          observation_source: (params.source as string) || "conversation", added_at: new Date().toISOString()
+        }
+      }]);
+    } catch (e) {
+      notVectorized.push(newRowId as number);
+      console.error(`Observation ${obsId} landed in D1 but failed to vectorize: ${e}`);
+    }
 
     // Auto-supersede highly similar observations
     for (const old of contradictions) {
@@ -1349,7 +1358,9 @@ async function writeObservation(env: Env, params: Record<string, unknown>): Prom
     }
   }
 
-  let msg = `Added ${observations.length} observations to '${entity_name}' (vectorized)`;
+  let msg = notVectorized.length === 0
+    ? `Added ${observations.length} observations to '${entity_name}' (vectorized)`
+    : `Added ${observations.length} observations to '${entity_name}' (${notVectorized.length} NOT vectorized — embedding failed; rows ${notVectorized.join(", ")} are in D1, do not retry)`;
   if (totalSuperseded > 0) {
     msg += `. Superseded ${totalSuperseded} older observation${totalSuperseded > 1 ? 's' : ''}.`;
   }
@@ -4957,17 +4968,24 @@ async function handleApiObservations(request: Request, env: Env, pathParts: stri
 
     // Vectorize
     const entity = await env.DB.prepare("SELECT name FROM entities WHERE id = ?").bind(body.entity_id).first();
+    let vectorized = false;
     if (entity) {
       const obsId = result.meta.last_row_id;
-      const embedding = await getEmbedding(env, `${entity.name}: ${body.content}`);
-      await env.VECTORS.upsert([{
-        id: `obs-${body.entity_id}-${obsId}`,
-        values: embedding,
-        metadata: { source: "observation", entity: entity.name as string, content: body.content as string, weight: (body.weight || "medium") as string, added_at: new Date().toISOString() }
-      }]);
+      try {
+        const embedding = await getEmbedding(env, `${entity.name}: ${body.content}`);
+        await env.VECTORS.upsert([{
+          id: `obs-${body.entity_id}-${obsId}`,
+          values: embedding,
+          metadata: { source: "observation", entity: entity.name as string, content: body.content as string, weight: (body.weight || "medium") as string, added_at: new Date().toISOString() }
+        }]);
+        vectorized = true;
+      } catch (e) {
+        // Row landed in D1 — report it rather than 500 and invite a duplicate
+        console.error(`REST observation ${obsId} landed in D1 but failed to vectorize: ${e}`);
+      }
     }
 
-    return jsonResponse({ id: result.meta.last_row_id, ...body }, 201);
+    return jsonResponse({ id: result.meta.last_row_id, vectorized, ...body }, 201);
   }
 
   // POST /api/observations/:id/sit - sit with observation
