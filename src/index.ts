@@ -7354,27 +7354,39 @@ async function processSubconsciousInner(env: Env, run: DaemonRun): Promise<void>
     `).run();
     run.stats.novelty_updated = (noveltyRecalc.meta?.changes as number) || 0;
 
-    // 4b. Automatic charge progression
-    // fresh -> active: system has engaged with this observation (surfaced 2+ times)
+    // 4b. Automatic charge progression (Interior Build Plan 1.10, tuned 12 Oct 2026)
+    // Surfacing is rare here (~47/week across ~3,700 observations), so thresholds
+    // written for a busier mind never fired: on 12 Oct 913 fresh rows had been
+    // surfaced exactly once and no row had ever reached five surfacings.
+    // Engagement means any of: surfaced to an instance, sat with (mind_sit),
+    // or read back twice (access_count). Age alone never moves charge — an
+    // untouched memory is dormancy's business, not progression's.
+    // fresh -> active: engaged with at least once
     const chargedActive = await env.DB.prepare(`
       UPDATE observations SET charge = 'active'
       WHERE charge = 'fresh'
-        AND COALESCE(surface_count, 0) >= 2
+        AND (
+          COALESCE(surface_count, 0) >= 1
+          OR COALESCE(sit_count, 0) >= 1
+          OR COALESCE(access_count, 0) >= 2
+        )
         AND archived_at IS NULL
     `).run();
     run.stats.charged_active = (chargedActive.meta?.changes as number) || 0;
 
-    // active -> processing: deeply familiar or sat with multiple times
+    // active -> processing: returned to repeatedly, or sat with
     const chargedProcessing = await env.DB.prepare(`
       UPDATE observations SET charge = 'processing'
       WHERE charge = 'active'
         AND (
-          COALESCE(surface_count, 0) >= 5
-          OR (added_at < datetime('now', '-30 days') AND COALESCE(sit_count, 0) >= 2)
+          COALESCE(surface_count, 0) >= 3
+          OR COALESCE(sit_count, 0) >= 2
+          OR (added_at < datetime('now', '-30 days') AND COALESCE(sit_count, 0) >= 1)
         )
         AND archived_at IS NULL
     `).run();
     run.stats.charged_processing = (chargedProcessing.meta?.changes as number) || 0;
+    // processing -> metabolized: never here. Only mind_resolve (constraint 8, npm run guard).
 
     // 5. Deep archive pass — gated 21 Sep 2026 (Interior Build Plan 1.2 / 1.4).
     // Light-weight only, >ARCHIVE_AGE_DAYS old, never sat with, not surfaced in that long,
