@@ -3997,9 +3997,12 @@ async function handleMindArchive(env: Env, params: Record<string, unknown>): Pro
 
       if (!obs) return `Observation #${observationId} not found in archive`;
 
-      // Un-archive: set archived_at to NULL
+      // Un-archive, with the rescue hold (0005, 14 Oct 2026): rescued_at marks a
+      // deliberate act; while last_surfaced_at stays NULL the daemon's archive,
+      // novelty, decay and dormancy passes leave this row alone.
       await env.DB.prepare(`
-        UPDATE observations SET archived_at = NULL WHERE id = ?
+        UPDATE observations SET archived_at = NULL, rescued_at = datetime('now'),
+          last_surfaced_at = NULL, novelty_score = 1.0 WHERE id = ?
       `).bind(observationId).run();
 
       return `Rescued from the deep: observation #${observationId} from **${obs.entity_name}**\n"${String(obs.content).slice(0, 100)}..."\n\nNow back in active memory.`;
@@ -5943,7 +5946,7 @@ async function handleApiDormant(request: Request, env: Env, pathParts: string[])
     ).bind(id).run();
 
     await env.DB.prepare(
-      `UPDATE observations SET novelty_score = 1.0, last_surfaced_at = NULL WHERE id = ?`
+      `UPDATE observations SET novelty_score = 1.0, last_surfaced_at = NULL, rescued_at = datetime('now') WHERE id = ?`
     ).bind(id).run();
 
     return jsonResponse({ success: true });
@@ -6088,7 +6091,7 @@ async function handleApiArchive(request: Request, env: Env, pathParts: string[])
   // POST /api/archive/:id/rescue - un-archive observation
   if (request.method === "POST" && id && action === "rescue") {
     await env.DB.prepare(
-      `UPDATE observations SET archived_at = NULL, novelty_score = 0.8 WHERE id = ?`
+      `UPDATE observations SET archived_at = NULL, novelty_score = 0.8, rescued_at = datetime('now'), last_surfaced_at = NULL WHERE id = ?`
     ).bind(id).run();
 
     return jsonResponse({ success: true });
@@ -6876,6 +6879,7 @@ async function processSubconscious(env: Env): Promise<void> {
     await processSubconsciousInner(env, run);
   } catch (e) {
     run.error = run.error ? `${run.error} | ${e}` : String(e);
+    console.error("Daemon failed:", e); // upstream v4.0.1 scheduleDaemon parity: log AND rethrow, so cron sees the failure
     throw e;
   } finally {
     if (!run.skipped) await writeDaemonRun(env, run);
@@ -7318,6 +7322,7 @@ async function processSubconsciousInner(env: Env, run: DaemonRun): Promise<void>
         AND (o.charge != 'metabolized' OR o.charge IS NULL)
         AND o.weight IN ('medium', 'heavy')
         AND o.archived_at IS NULL
+        AND NOT (o.rescued_at IS NOT NULL AND o.last_surfaced_at IS NULL) -- rescue hold (0005, 14 Oct 2026)
     `).run();
     dormantIdentified = (dormantInsert.meta?.changes as number) || 0;
     run.stats.dormant_marked = dormantIdentified;
@@ -7351,6 +7356,7 @@ async function processSubconsciousInner(env: Env, run: DaemonRun): Promise<void>
       )
       WHERE archived_at IS NULL
         AND (charge != 'metabolized' OR charge IS NULL)
+        AND NOT (rescued_at IS NOT NULL AND last_surfaced_at IS NULL) -- rescue hold (0005, 14 Oct 2026)
     `).run();
     run.stats.novelty_updated = (noveltyRecalc.meta?.changes as number) || 0;
 
@@ -7405,6 +7411,7 @@ async function processSubconsciousInner(env: Env, run: DaemonRun): Promise<void>
         AND COALESCE(o.context, 'default') != 'creative-space'
         AND COALESCE(e.salience, 'active') != 'foundational'
         AND e.name NOT IN ('The Room', 'The_Room')
+        AND NOT (o.rescued_at IS NOT NULL AND o.last_surfaced_at IS NULL) -- rescue hold (0005, 14 Oct 2026)
       LIMIT 50
     `).all();
 
@@ -7433,6 +7440,7 @@ async function processSubconsciousInner(env: Env, run: DaemonRun): Promise<void>
           AND COALESCE(access_count, 0) = 0
           AND added_at < datetime('now', '-${ACCESS_DECAY_AGE_DAYS} days')
           AND novelty_score > 0.3
+          AND NOT (rescued_at IS NOT NULL AND last_surfaced_at IS NULL) -- rescue hold (0005, 14 Oct 2026)
       `).run();
       run.stats.access_decayed = (accessDecay.meta?.changes as number) || 0;
     } catch { /* access_count column may not exist yet */ }
