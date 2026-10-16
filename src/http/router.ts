@@ -31,6 +31,7 @@ interface AppRouteHandlers {
     pathParts: string[]
   ): Promise<Response>;
   handleApiSearch(request: Request, env: Env): Promise<Response>;
+  handleApiRecall(request: Request, env: Env): Promise<Response>;
   handleApiSurface(request: Request, env: Env): Promise<Response>;
   handleApiIdentity(
     request: Request,
@@ -322,6 +323,7 @@ async function routeApiRequest(
     }
 
     if (pathParts[1] === "search") return await handlers.handleApiSearch(request, env);
+    if (pathParts[1] === "recall") return await handlers.handleApiRecall(request, env);
     if (pathParts[1] === "surface") return await handlers.handleApiSurface(request, env);
     if (pathParts[1] === "orient") return await handlers.handleApiOrient(env);
     if (pathParts[1] === "ground") return await handlers.handleApiGround(env);

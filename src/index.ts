@@ -5165,6 +5165,83 @@ async function handleApiSearch(request: Request, env: Env): Promise<Response> {
   });
 }
 
+/**
+ * GET /api/recall?q=<text>&n=3&min_score=0.6
+ *
+ * The per-turn recall packet (17 Oct 2026). Unlike /api/search this is NOT mood-tinted,
+ * returns observations and journals only (no entities, no images), skips anything archived,
+ * superseded or expired, and carries provenance on every line so the caller can say who said
+ * it, when, and how much to trust it. Read-only; Bearer-gated like every /api route.
+ */
+async function handleApiRecall(request: Request, env: Env): Promise<Response> {
+  const sp = new URL(request.url).searchParams;
+  const q = (sp.get("q") || "").trim();
+  if (!q) return jsonResponse({ error: "Missing query parameter 'q'" }, 400);
+  const n = Math.min(Math.max(parseInt(sp.get("n") || "3", 10) || 3, 1), 8);
+  const minScore = Math.min(Math.max(parseFloat(sp.get("min_score") || "0") || 0, 0), 1);
+
+  const started = Date.now();
+  const embedding = await getEmbedding(env, q.slice(0, 2000));
+  const vr = await env.VECTORS.query(embedding, { topK: Math.max(n * 5, 15), returnMetadata: "all" });
+  const matches = (vr.matches || []).filter(m => m.id.startsWith("obs-") || m.id.startsWith("journal-"));
+
+  const obsIds: number[] = []; const jIds: number[] = [];
+  for (const m of matches) {
+    const parts = m.id.split("-");
+    const id = parseInt(parts[parts.length - 1], 10);
+    if (!Number.isFinite(id)) continue;
+    (m.id.startsWith("obs-") ? obsIds : jIds).push(id);
+  }
+
+  type Row = { kind: "observation" | "journal"; id: number; score: number; entity: string | null; date: string | null; source: string | null; weight: string | null; emotion: string | null; text: string };
+  const byKey = new Map<string, Row>();
+  const nowIso = new Date().toISOString();
+
+  if (obsIds.length) {
+    const ph = obsIds.map(() => "?").join(",");
+    const rows = await env.DB.prepare(`
+      SELECT o.id, o.content, o.source, o.weight, o.source_date, o.added_at, o.emotion,
+             o.archived_at, o.superseded_by, o.valid_until, e.name AS entity_name
+      FROM observations o JOIN entities e ON o.entity_id = e.id
+      WHERE o.id IN (${ph})`).bind(...obsIds).all();
+    for (const r of (rows.results || []) as Record<string, unknown>[]) {
+      if (r.archived_at || r.superseded_by) continue;
+      if (r.valid_until && String(r.valid_until) < nowIso) continue;
+      byKey.set(`obs-${r.id}`, {
+        kind: "observation", id: Number(r.id), score: 0,
+        entity: (r.entity_name as string) ?? null,
+        date: ((r.source_date as string) || (r.added_at as string) || null)?.slice(0, 10) ?? null,
+        source: (r.source as string) ?? null, weight: (r.weight as string) ?? null,
+        emotion: (r.emotion as string) ?? null, text: String(r.content ?? ""),
+      });
+    }
+  }
+  if (jIds.length) {
+    const ph = jIds.map(() => "?").join(",");
+    const rows = await env.DB.prepare(`SELECT id, entry_date, content, emotion FROM journals WHERE id IN (${ph})`).bind(...jIds).all();
+    for (const r of (rows.results || []) as Record<string, unknown>[]) {
+      byKey.set(`journal-${r.id}`, {
+        kind: "journal", id: Number(r.id), score: 0, entity: null,
+        date: ((r.entry_date as string) || null)?.slice(0, 10) ?? null,
+        source: "journal", weight: null, emotion: (r.emotion as string) ?? null,
+        text: String(r.content ?? "").replace(/<<<TS:[^>]*>>>\s*/g, ""),
+      });
+    }
+  }
+
+  const out: Row[] = [];
+  for (const m of matches) {
+    const key = m.id.startsWith("obs-") ? `obs-${m.id.split("-").pop()}` : `journal-${m.id.split("-").pop()}`;
+    const row = byKey.get(key);
+    if (!row || m.score < minScore) continue;
+    row.score = Math.round(m.score * 1000) / 1000;
+    row.text = row.text.length > 400 ? row.text.slice(0, 399) + "…" : row.text;
+    out.push(row);
+    if (out.length >= n) break;
+  }
+  return jsonResponse({ query: q, n: out.length, ms: Date.now() - started, results: out });
+}
+
 async function handleApiSurface(request: Request, env: Env): Promise<Response> {
   const params = new URL(request.url).searchParams;
   const query = params.get("query");
@@ -7548,6 +7625,7 @@ export default {
       handleApiJournals,
       handleApiThreads,
       handleApiSearch,
+    handleApiRecall,
       handleApiSurface,
       handleApiIdentity,
       handleApiRelations,
