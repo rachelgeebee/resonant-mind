@@ -1460,7 +1460,10 @@ async function handleMindSearch(env: Env, params: Record<string, unknown>): Prom
   }
 
   // Search with tinted query — fetch more when filtering by type
-  const searchLimit = filterType ? n_results * 10 : n_results;
+  const baseSearchLimit = filterType ? n_results * 10 : n_results;
+  const searchLimit = hasFilters ? Math.min(Math.max(baseSearchLimit * 4, 40), 50) : baseSearchLimit; // Vectorize caps topK at 50 with full metadata
+  // (19 Oct 2026: filters are strict now, and legacy husk vectors dominate generic
+  // similarity — a filtered search needs a deep candidate pool or it starves.)
   const vectorResults = await searchVectors(env, tintedQuery, searchLimit);
 
   if (!vectorResults.matches?.length) {
@@ -1586,16 +1589,51 @@ ${String(r.content).slice(0, 300)}...
       }
     }
 
-    // Apply filters if any
+    // Journals get the same D1 join observations have (19 Oct 2026 — the canary
+    // found journal results rendered from vector metadata only, so rows whose
+    // metadata lacks content displayed as "…" husks and filters never applied).
+    const journalIds: number[] = [];
+    for (const match of obsMatches) {
+      if (match.id.startsWith('journal-')) {
+        const jid = parseInt(match.id.slice('journal-'.length));
+        if (!isNaN(jid)) journalIds.push(jid);
+      }
+    }
+    const journalDetails = new Map<number, { entry_date: string; content: string }>();
+    if (journalIds.length > 0) {
+      try {
+        const ph = journalIds.map(() => '?').join(',');
+        const jd = await env.DB.prepare(
+          `SELECT id, entry_date, content FROM journals WHERE id IN (${ph})`
+        ).bind(...journalIds).all();
+        for (const r of (jd.results || []) as Array<{ id: number; entry_date: string; content: string }>) {
+          journalDetails.set(r.id, { entry_date: r.entry_date, content: r.content });
+        }
+      } catch { /* journals render from metadata fallback below */ }
+    }
+
+    // Apply filters if any. Strict since 19 Oct 2026: when a filter is active,
+    // a match we cannot resolve against D1 FAILS the filter (the old default
+    // passed unresolvable matches through, so keyword= returned husks).
     let filteredMatches = obsMatches;
-    if (hasFilters && obsDetails.size > 0) {
+    if (hasFilters) {
       filteredMatches = obsMatches.filter(match => {
-        if (!match.id.startsWith('obs-')) return true;
+        if (match.id.startsWith('journal-')) {
+          const jid = parseInt(match.id.slice('journal-'.length));
+          const jd = journalDetails.get(jid);
+          if (!jd) return false;
+          if (filterKeyword && !jd.content.toLowerCase().includes(filterKeyword.toLowerCase())) return false;
+          if (filterSource || filterEntity || filterWeight) return false; // observation-only filters
+          if (filterDateFrom && jd.entry_date < filterDateFrom) return false;
+          if (filterDateTo && jd.entry_date > filterDateTo) return false;
+          return true;
+        }
+        if (!match.id.startsWith('obs-')) return false; // legacy ids (j-*): unresolvable under filters
         const parts = match.id.split('-');
-        if (parts.length < 3) return true;
+        if (parts.length < 3) return false;
         const obsId = parseInt(parts[2]);
         const details = obsDetails.get(obsId);
-        if (!details) return true;
+        if (!details) return false;
 
         // Apply filters
         if (filterKeyword && !details.content.toLowerCase().includes(filterKeyword.toLowerCase())) return false;
@@ -1608,6 +1646,7 @@ ${String(r.content).slice(0, 300)}...
         return true;
       });
     }
+    const excludedByFilters = hasFilters ? obsMatches.length - filteredMatches.length : 0;
 
     // Phase 2: Filter out superseded/expired observations by default
     const includeExpired = params.include_expired as boolean;
@@ -1661,12 +1700,38 @@ ${String(r.content).slice(0, 300)}...
 
     scoredMatches.sort((a, b) => b.compositeScore - a.compositeScore);
 
-    // Track access for returned observation IDs
-    const accessedObsIds: number[] = [];
-    const accessedImgIds: number[] = [];
-    for (const match of scoredMatches.slice(0, n_results)) {
+    // Resolve content D1-first (19 Oct 2026); suppress what nothing can resolve
+    // instead of rendering "…" husks, and say how many were suppressed so the
+    // orphan population stays visible until the sweep runs.
+    let suppressedHusks = 0;
+    const renderables: Array<{ match: typeof scoredMatches[number]; content: string; journal?: { entry_date: string } }> = [];
+    for (const match of scoredMatches) {
+      if (renderables.length >= n_results) break;
+      const meta = match.metadata as Record<string, string>;
+      if (match.id.startsWith('journal-')) {
+        const jid = parseInt(match.id.slice('journal-'.length));
+        const jd = journalDetails.get(jid);
+        const content = jd?.content || meta?.content || '';
+        if (!content) { suppressedHusks++; continue; }
+        renderables.push({ match, content, journal: { entry_date: jd?.entry_date || meta?.title || '' } });
+        continue;
+      }
+      let obsContent = '';
       if (match.id.startsWith('obs-')) {
         const parts = match.id.split('-');
+        if (parts.length >= 3) obsContent = obsDetails.get(parseInt(parts[2]))?.content || '';
+      }
+      const content = obsContent || meta?.content || '';
+      if (!content) { suppressedHusks++; continue; }
+      renderables.push({ match, content });
+    }
+
+    // Track access for the observations actually shown
+    const accessedObsIds: number[] = [];
+    const accessedImgIds: number[] = [];
+    for (const r of renderables) {
+      if (r.match.id.startsWith('obs-')) {
+        const parts = r.match.id.split('-');
         if (parts.length >= 3) accessedObsIds.push(parseInt(parts[2]));
       }
     }
@@ -1690,13 +1755,18 @@ ${String(r.content).slice(0, 300)}...
     }
 
     output += `**Observations:**${filterDesc}\n`;
-    for (const match of scoredMatches.slice(0, n_results)) {
+    for (const r of renderables) {
+      const match = r.match;
       const meta = match.metadata as Record<string, string>;
+      if (r.journal) {
+        const displayScore = ((match as any).compositeScore * 100).toFixed(1);
+        output += `**[journal] ${r.journal.entry_date}** (${displayScore}%)\n`;
+        output += `${r.content.slice(0, 300)}${r.content.length > 300 ? '…' : ''}\n\n`;
+        continue;
+      }
       const label = meta?.entity || meta?.entity_name || meta?.title || match.id;
       const sourceType = meta?.source || 'unknown';
       const context = meta?.context ? ` [${meta.context}]` : '';
-
-      // Get details from D1 if available
       let obsId: number | null = null;
       if (match.id.startsWith('obs-')) {
         const parts = match.id.split('-');
@@ -1711,7 +1781,13 @@ ${String(r.content).slice(0, 300)}...
       const displayScore = ((match as any).compositeScore * 100).toFixed(1);
 
       output += `**[${sourceType}]${context} ${label}**${archivedTag}${supersededTag}${sourceTag}${dateTag} (${displayScore}%)\n`;
-      output += `${meta?.content?.slice(0, 300) || ''}...\n\n`;
+      output += `${r.content.slice(0, 300)}${r.content.length > 300 ? '…' : ''}\n\n`;
+    }
+    if (suppressedHusks > 0) {
+      output += `*${suppressedHusks} unresolvable legacy vector${suppressedHusks === 1 ? '' : 's'} suppressed (orphan sweep pending)*\n\n`;
+    }
+    if (excludedByFilters > 0 && renderables.length === 0) {
+      output += `*No matches survived the filters — ${excludedByFilters} candidate${excludedByFilters === 1 ? '' : 's'} excluded (unresolvable legacy vectors fail active filters; orphan sweep pending). Try without filters or a more specific query.*\n\n`;
     }
   }
 
